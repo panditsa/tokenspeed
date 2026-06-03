@@ -952,6 +952,11 @@ class AsyncCopyDescriptor:
             USE_MASK_RESOLVED: gl.constexpr = USE_MASK
         CACHE_MODIFIER: gl.constexpr = self.cache_modifier
         off_k_step = idx * self.BLOCK_K
+        # off_k_step = idx*BLOCK_K is uniform and non-negative; asserting it
+        # lets AnnotateBufferOpSplitSafety tag the load split-safe so the
+        # uniform per-iter term is hoisted into the scalar `soffset` (removing
+        # the per-lane v_add from the K-loop address math).
+        gl.assume(off_k_step >= 0)
         offsets = self.offsets + off_k_step * self.stride_k
         if USE_MASK_RESOLVED == 0:
             gl.amd.cdna4.async_copy.buffer_load_to_shared(
@@ -2339,6 +2344,29 @@ def _pipelined_moe_tile_compute(
     off_n = pid_n * BLOCK_N
     w_base_offset = expert_id * stride_we
     ws_base_offset = expert_id * stride_wse
+
+    # Non-negativity facts on the scalar offset leaves so
+    # AnnotateBufferOpSplitSafety can prove the W / scale buffer offsets are
+    # >= 0 and tag the loads `amdgpu.split_soffset_safe`. That enables
+    # OffsetUniformitySplit to hoist the uniform per-iter K term into the
+    # scalar `soffset` instead of a per-lane VGPR offset add. These are all
+    # genuine invariants (tensor strides, expert/tile base offsets, program
+    # ids are non-negative). The X/dispatch load uses a memory-gathered row
+    # index that cannot be proven this way and is intentionally left unsplit.
+    gl.assume(pid_n >= 0)
+    gl.assume(expert_id >= 0)
+    gl.assume(off_n >= 0)
+    gl.assume(w_base_offset >= 0)
+    gl.assume(ws_base_offset >= 0)
+    gl.assume(stride_we >= 0)
+    gl.assume(stride_wn >= 0)
+    gl.assume(stride_wk >= 0)
+    gl.assume(stride_wse >= 0)
+    gl.assume(stride_wsn >= 0)
+    gl.assume(stride_wsk >= 0)
+    gl.assume(stride_xk >= 0)
+    gl.assume(stride_xsk >= 0)
+    gl.assume(stride_xsm >= 0)
 
     STORE: gl.constexpr = _store_layout(
         NUM_WARPS, block_m=BLOCK_M, w_via_vgpr=W_VIA_VGPR
