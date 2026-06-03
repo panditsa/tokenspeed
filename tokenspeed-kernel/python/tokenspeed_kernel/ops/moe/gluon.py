@@ -288,6 +288,111 @@ def shuffle_weight_for_gluon_dot_layout(
     return out
 
 
+def _b_preshuffle_3d_sibling(b: torch.Tensor) -> torch.Tensor:
+    """gluon-kernels' ``_b_preshuffle_3d`` ((16, 16) MFMA-tile layout).
+
+    ``(E, N, K_pk)`` viewed as ``(E, N//16, 16, K_pk//32, 2, 16)``,
+    permuted ``(0, 1, 3, 4, 2, 5)``, contiguous. Pure rearrange. The
+    resulting per-expert flat byte offset for logical ``(n, k_pk)`` is::
+
+        (n // 16) * (16 * K_pk)
+          + (k_pk // 32) * 512
+          + ((k_pk // 16) % 2) * 256
+          + (n % 16) * 16
+          + (k_pk % 16)
+
+    which is exactly the closed form the kernel's sibling W_VIA_VGPR path
+    re-derives in ``_pipelined_moe_tile_compute``.
+    """
+    assert b.dtype == torch.uint8, "B must be packed fp4 in uint8"
+    assert b.ndim == 3, f"B must be 3-D (E, N, K/2), got {tuple(b.shape)}"
+    E, N, K_pk = b.shape
+    assert N % 16 == 0, f"N ({N}) must be divisible by 16"
+    assert K_pk % 32 == 0, f"K/2 ({K_pk}) must be divisible by 32"
+    b_6d = b.view(E, N // 16, 16, K_pk // 32, 2, 16)
+    return b_6d.permute(0, 1, 3, 4, 2, 5).contiguous().view(E, N, K_pk)
+
+
+def shuffle_weight_for_gluon_sibling(
+    w: torch.Tensor, *, block_n: int = 128
+) -> torch.Tensor:
+    """Port of gluon-kernels' host B preshuffle for the PR W_VIA_VGPR path.
+
+    The PR stores W as ``(E, K_pk, N)``; the sibling kernel consumes the
+    (16, 16) layout over ``(N, K_pk)``. We transpose to ``(E, N, K_pk)``,
+    apply :func:`_b_preshuffle_3d_sibling`, then re-view the contiguous
+    sibling-ordered buffer back to a nominal ``(E, K_pk, N)`` shape so the
+    launcher's ``N``/``K`` derivation is unchanged. The kernel's sibling
+    path ignores ``stride_wn``/``stride_wk`` and uses the closed-form
+    offsets keyed on ``K_PACKED_TOTAL = K // DIV_FACTOR_W``.
+
+    Requires ``K_pk`` already a multiple of 128 (no tail padding); raise
+    otherwise so callers pad upstream.
+    """
+    w3 = w if w.ndim == 3 else w.unsqueeze(0)
+    E, K_pk, N = w3.shape
+    if N % block_n != 0:
+        raise ValueError(
+            f"sibling preshuffle requires N divisible by block_n={block_n} "
+            f"(got N={N}); pad W + W-scale upstream."
+        )
+    if K_pk % 128 != 0:
+        raise ValueError(
+            f"sibling preshuffle requires K_pk multiple of 128 (got {K_pk}); "
+            f"pad W upstream."
+        )
+    b_nk = w3.transpose(1, 2).contiguous()  # (E, N, K_pk)
+    sib = _b_preshuffle_3d_sibling(b_nk)  # (E, N, K_pk) contiguous sibling order
+    # Re-view the sibling-ordered flat buffer to (E, K_pk, N): shape is
+    # nominal (kernel reads via closed-form offsets, not these strides).
+    out = sib.reshape(E, N * K_pk).view(E, K_pk, N)
+    out.is_shuffled_for_gluon_dot = True
+    out.is_shuffled_for_gluon_sibling = True
+    out.original_k_pk = K_pk
+    return out
+
+
+def shuffle_w_scale_for_gluon_sibling(w_scale: torch.Tensor) -> torch.Tensor:
+    """e8m0_shuffle the W block-scale for the sibling B-scale VGPR path.
+
+    Input is the raw e8m0 scale ``(E, N, K//32)`` uint8. We apply aiter's
+    ``e8m0_shuffle`` (``shuffle_scale``: pad rows->mult256 / cols->mult8,
+    then a (m,n) reshape+permute) over the flattened ``(E*N, K//32)`` rows,
+    exactly like gluon-kernels' bench
+    (``e8m0_shuffle(s.view(E*N, K_scale)).view(E, N, K_scale)``), and view
+    back to ``(E, N, K//32)``. The kernel's closed-form ``buffer_load``
+    offsets (``ScaleVgprDescriptor``) invert this layout.
+
+    Requires ``E*N % 256 == 0`` and ``(K//32) % 8 == 0`` so the shuffle
+    introduces no padding and the view-back is exact; raise otherwise.
+    """
+    from aiter.utility.fp4_utils import e8m0_shuffle
+
+    ws = w_scale if w_scale.ndim == 3 else w_scale.unsqueeze(0)
+    if ws.dtype != torch.uint8:
+        raise ValueError(f"w_scale must be uint8 e8m0, got {ws.dtype}")
+    E, N, K_scale = ws.shape
+    if (E * N) % 256 != 0:
+        raise ValueError(
+            f"sibling scale shuffle requires E*N divisible by 256 "
+            f"(got E*N={E * N}); pad N upstream."
+        )
+    if K_scale % 8 != 0:
+        raise ValueError(
+            f"sibling scale shuffle requires K//32 multiple of 8 "
+            f"(got {K_scale}); needs K % 256 == 0."
+        )
+    sh = e8m0_shuffle(ws.reshape(E * N, K_scale).contiguous())
+    if tuple(sh.shape) != (E * N, K_scale):
+        raise RuntimeError(
+            f"e8m0_shuffle padded the scale to {tuple(sh.shape)}; expected "
+            f"({E * N}, {K_scale}) -- shape assumptions violated."
+        )
+    out = sh.reshape(E, N, K_scale).contiguous()
+    out.is_e8m0_shuffled_for_gluon_sibling = True
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Layout factories (gluon constexpr functions)
 # ---------------------------------------------------------------------------
@@ -520,6 +625,8 @@ class MoEConfig:
     W_TRANSPOSE: gl.constexpr
     W_VIA_VGPR: gl.constexpr
     W_PREFETCH: gl.constexpr
+    W_VIA_VGPR_SIBLING: gl.constexpr
+    SCALE_VIA_VGPR_SIBLING: gl.constexpr
     NUM_BUFFERS: gl.constexpr
 
     SCALE_BLOCK: gl.constexpr
@@ -579,6 +686,8 @@ class MoEConfig:
         NUM_WARPS=4,
         W_VIA_VGPR=False,
         W_PREFETCH=True,
+        W_VIA_VGPR_SIBLING=False,
+        SCALE_VIA_VGPR_SIBLING=False,
     ):
         if SCALE_LOAD_MODE not in _SCALE_LOAD_MODES:
             raise ValueError(
@@ -592,6 +701,8 @@ class MoEConfig:
         self.W_TRANSPOSE = gl.constexpr(W_TRANSPOSE)
         self.W_VIA_VGPR = gl.constexpr(W_VIA_VGPR)
         self.W_PREFETCH = gl.constexpr(W_PREFETCH)
+        self.W_VIA_VGPR_SIBLING = gl.constexpr(W_VIA_VGPR_SIBLING)
+        self.SCALE_VIA_VGPR_SIBLING = gl.constexpr(SCALE_VIA_VGPR_SIBLING)
         self.WITH_X_MX_SCALE = gl.constexpr(WITH_X_MX_SCALE)
         self.WITH_W_MX_SCALE = gl.constexpr(WITH_W_MX_SCALE)
         self.SCALE_LOAD_MODE = gl.constexpr(SCALE_LOAD_MODE)
@@ -601,8 +712,15 @@ class MoEConfig:
         self.DTYPE_X = gl.constexpr(DTYPE_X)
         self.DTYPE_W = gl.constexpr(DTYPE_W)
 
-        _scale_via_lds = SCALE_LOAD_MODE == "swizzle" and (
-            WITH_X_MX_SCALE or WITH_W_MX_SCALE
+        # The sibling B-scale VGPR path consumes the e8m0_shuffle'd scale
+        # directly via buffer_load (no LDS staging), so it forces the LDS
+        # scale ring off. This flips get_mfma_layout's tiles_per_warp from
+        # [2,2] (LDS unswizzle) to [1,1]; all dot/acc/store layouts derive
+        # from MFMA_LAYOUT so they stay self-consistent.
+        _scale_via_lds = (
+            SCALE_LOAD_MODE == "swizzle"
+            and (WITH_X_MX_SCALE or WITH_W_MX_SCALE)
+            and not SCALE_VIA_VGPR_SIBLING
         )
         self.SCALE_VIA_LDS = gl.constexpr(_scale_via_lds)
         self.PRESHUFFLE_FACTOR = gl.constexpr(_SCALE_PRESHUFFLE_FACTOR)
@@ -1045,14 +1163,24 @@ class WVgprDescriptor:
     pred: gl.tensor  # int1 scalar (broadcast to a per-element mask)
     BLOCK_K: gl.constexpr  # = BLOCK_K_W; mirrors AsyncCopyDescriptor
     LOAD_BN: gl.constexpr  # N width per load; SUB_BN under sliceN
+    SIBLING: gl.constexpr  # gluon-kernels (16,16) closed-form offsets
 
     @gluon.constexpr_function
     def __init__(
-        self, cfg: MoEConfig, BLOCK_K, ptr, stride_k, offsets, pred, LOAD_BN=None
+        self,
+        cfg: MoEConfig,
+        BLOCK_K,
+        ptr,
+        stride_k,
+        offsets,
+        pred,
+        LOAD_BN=None,
+        SIBLING=False,
     ):
         self.cfg = cfg
         self.BLOCK_K = gl.constexpr(BLOCK_K)
         self.LOAD_BN = gl.constexpr(LOAD_BN if LOAD_BN is not None else cfg.BLOCK_N)
+        self.SIBLING = gl.constexpr(SIBLING)
         self.ptr = ptr
         self.stride_k = stride_k
         self.offsets = offsets
@@ -1075,19 +1203,74 @@ class WVgprDescriptor:
             ptr=ptr_iter, offsets=self.offsets, mask=self.pred
         )
 
-        # 5-D HBM layout -> (BLOCK_K_W, LOAD_BN) MFMA-ready.
-        tile_5d = tile_flat.reshape(
-            LOAD_BN // 16,
-            BLOCK_K_W // 64,
-            4,
-            16,
-            16,
-        )
-        tile_perm = tile_5d.permute(0, 3, 1, 2, 4)
-        tile_2d = tile_perm.reshape(LOAD_BN, BLOCK_K_W)
-        tile_t = tile_2d.trans(1, 0)
+        if self.SIBLING:
+            # gluon-kernels path: ``offsets`` were built directly in
+            # ``dot_layout``'s register arrangement (k along dim0 via
+            # SliceLayout(1,...), n along dim1 via SliceLayout(0,...)),
+            # so the buffer_load result already carries each logical
+            # (k, n) byte -- no reshape/permute/transpose needed (the
+            # whole point of the sibling's closed-form load). The PR's
+            # dot_layout_w uses warps_per_cta=[2,2]/tiles_per_warp=[2,2],
+            # so the slice-reconstructed load layout is not *trivially*
+            # equal to it; a (correct) non-trivial convert re-seats each
+            # element where the MFMA expects it. Layout differs, values
+            # are identical.
+            out = gl.convert_layout(tile_flat, dot_layout)
+        else:
+            # 5-D HBM layout -> (BLOCK_K_W, LOAD_BN) MFMA-ready.
+            tile_5d = tile_flat.reshape(
+                LOAD_BN // 16,
+                BLOCK_K_W // 64,
+                4,
+                16,
+                16,
+            )
+            tile_perm = tile_5d.permute(0, 3, 1, 2, 4)
+            tile_2d = tile_perm.reshape(LOAD_BN, BLOCK_K_W)
+            tile_t = tile_2d.trans(1, 0)
+            out = gl.convert_layout(tile_t, dot_layout, assert_trivial=True)
+        return out
 
-        return gl.convert_layout(tile_t, dot_layout, assert_trivial=True)
+
+@gluon.aggregate
+class ScaleVgprDescriptor:
+    """Sibling B-scale (e8m0_shuffle) direct HBM->VGPR buffer_load.
+
+    Parallel to ``WVgprDescriptor`` but for the W block-scale: the host
+    pre-shuffles the e8m0 scale with aiter's ``e8m0_shuffle`` (the
+    ``shuffle_scale`` (m, n) reshape+permute), so the flat byte offset of
+    logical ``(n, k_scale)`` is a closed form. ``offsets`` is built
+    directly in ``cfg.layout_w_scale`` (the MFMA scale VGPR layout) so the
+    ``buffer_load`` result feeds straight into ``mfma_scaled`` with no
+    reshape/convert. The per-K-iter advance is the constexpr
+    ``K_STEP`` (= 256 elements for BLOCK_K_SCALE=8); the lane- and
+    N-only piece is folded into ``offsets``. Mirrors gluon-kernels'
+    ``_load_b_scale_vgpr`` (stage1_kernel.py ~148) but for the plain
+    ``shuffle_scale`` layout (not the opsel_b variant), so the row term
+    is ``(n//32)*(stride_se_n_pad*32) + (n%16)*4 + (n%32)//16`` and the
+    K-step is 256 rather than 1024.
+    """
+
+    cfg: MoEConfig
+    ptr: gl.tensor  # w_scale base + per-expert offset
+    offsets: gl.tensor  # static [BLOCK_N, BLOCK_K_SCALE] in layout_w_scale
+    K_STEP: gl.constexpr  # per-K-iter advance (elements)
+
+    @gluon.constexpr_function
+    def __init__(self, cfg: MoEConfig, ptr, offsets, K_STEP):
+        self.cfg = cfg
+        self.ptr = ptr
+        self.offsets = offsets
+        self.K_STEP = gl.constexpr(K_STEP)
+
+    @gluon.jit
+    def issue_global_load_to_vgpr(self, idx):
+        # idx-th BLOCK_K scale tile; the uniform K-step folds into the
+        # per-lane offset and HW masks OOB lanes to 0 (the matching W
+        # data K-mask zeros any OOB product on the !EVEN_K tail).
+        return gl.amd.cdna4.buffer_load(
+            ptr=self.ptr, offsets=self.offsets + idx * self.K_STEP
+        )
 
 
 @gluon.jit
@@ -1115,7 +1298,7 @@ class MoEPipelinedProgram:
     x_desc: AsyncCopyDescriptor
     w_desc: AsyncCopyDescriptor | WVgprDescriptor
     x_scale_desc: AsyncCopyDescriptor | gl.constexpr
-    w_scale_desc: AsyncCopyDescriptor | gl.constexpr
+    w_scale_desc: AsyncCopyDescriptor | ScaleVgprDescriptor | gl.constexpr
 
     @gluon.constexpr_function
     def __init__(
@@ -1271,7 +1454,9 @@ class MoEPipelinedProgram:
                     layout=cfg.layout_x_scale,
                 )
             if cfg.WITH_W_MX_SCALE:
-                if cfg.SCALE_VIA_LDS:
+                if cfg.SCALE_VIA_VGPR_SIBLING:
+                    scale_w = self.w_scale_desc.issue_global_load_to_vgpr(mfma_idx)
+                elif cfg.SCALE_VIA_LDS:
                     scale_w = self.w_scale_desc.issue_local_load_unswizzle(
                         mfma_idx,
                         self.w_scale_buffer,
@@ -1324,7 +1509,9 @@ class MoEPipelinedProgram:
                 )
 
             if cfg.WITH_W_MX_SCALE:
-                if cfg.SCALE_VIA_LDS:
+                if cfg.SCALE_VIA_VGPR_SIBLING:
+                    scale_w = self.w_scale_desc.issue_global_load_to_vgpr(mfma_idx)
+                elif cfg.SCALE_VIA_LDS:
                     scale_w = self.w_scale_desc.issue_local_load_unswizzle(
                         mfma_idx,
                         self.w_scale_buffer,
@@ -2323,6 +2510,8 @@ def _pipelined_moe_tile_compute(
     HAS_FP8_QUANT_OUT: gl.constexpr = False,
     W_VIA_VGPR: gl.constexpr = False,
     W_PREFETCH: gl.constexpr = True,
+    W_VIA_VGPR_SIBLING: gl.constexpr = False,
+    SCALE_VIA_VGPR_SIBLING: gl.constexpr = False,
 ):
     expert_id = compact_idx
 
@@ -2392,6 +2581,8 @@ def _pipelined_moe_tile_compute(
         NUM_WARPS,
         W_VIA_VGPR=W_VIA_VGPR,
         W_PREFETCH=W_PREFETCH,
+        W_VIA_VGPR_SIBLING=W_VIA_VGPR_SIBLING,
+        SCALE_VIA_VGPR_SIBLING=SCALE_VIA_VGPR_SIBLING,
     )
 
     BLOCK_K_X: gl.constexpr = cfg.BLOCK_K // cfg.DIV_FACTOR_X
@@ -2533,7 +2724,35 @@ def _pipelined_moe_tile_compute(
         mask_m[:, None],
         k_limit_x,
     )
-    if cfg.W_VIA_VGPR:
+    if cfg.W_VIA_VGPR and cfg.W_VIA_VGPR_SIBLING:
+        # gluon-kernels (16,16) preshuffle: closed-form HBM byte offset
+        # for logical (n, k_pk), built directly in ``dot_layout_w`` so the
+        # buffer_load result is MFMA-ready with no reshape/permute. The
+        # per-expert term folds into ``w_base_offset``; ``off_n`` (= pid_n
+        # * BLOCK_N) selects this tile's N columns. Mirrors stage1_kernel
+        # ``offs_b`` + ``b_k_part``/``b_n_part`` with ``b_data_k_off``.
+        K_PK_TOTAL = K // cfg.DIV_FACTOR_W
+        offs_bk_s = gl.arange(0, BLOCK_K_W, layout=gl.SliceLayout(1, cfg.dot_layout_w))
+        offs_bn_s = off_n + gl.arange(
+            0, BLOCK_N, layout=gl.SliceLayout(0, cfg.dot_layout_w)
+        )
+        b_k_part = (
+            (offs_bk_s // 32) * 512 + ((offs_bk_s // 16) % 2) * 256 + (offs_bk_s % 16)
+        )
+        b_n_part = (offs_bn_s // 16) * (16 * K_PK_TOTAL) + (offs_bn_s % 16) * 16
+        offsets_sib = gl.expand_dims(b_k_part, 1) + gl.expand_dims(b_n_part, 0)
+        # K-iter advance must be (BLOCK_K_W//32)*512 = BLOCK_K_W*16, so
+        # pass stride_k=16 (idx * BLOCK_K_W * 16).
+        w_desc = WVgprDescriptor(
+            cfg,
+            BLOCK_K_W,
+            w_ptr,
+            gl.to_tensor(16),
+            offsets_sib + w_base_offset,
+            pred=gl.to_tensor(True),
+            SIBLING=True,
+        )
+    elif cfg.W_VIA_VGPR:
         # Host-preshuffled W -> VGPR direct; bypasses LDS staging.
         TILE_BYTES: gl.constexpr = BLOCK_K_W * BLOCK_N
         offsets_b_vgpr = gl.expand_dims(offs_wk, 0) + gl.expand_dims(offs_wn, 1) * (
@@ -2635,7 +2854,45 @@ def _pipelined_moe_tile_compute(
         x_scale_desc: gl.constexpr = 0
 
     if HAS_W_BLOCK_SCALE:
-        if cfg.SCALE_VIA_LDS:
+        if cfg.SCALE_VIA_VGPR_SIBLING:
+            # e8m0_shuffle'd W-scale -> VGPR via buffer_load. Closed-form
+            # flat (element) offset for logical (n, k_scale) under aiter
+            # shuffle_scale's (m, n) reshape+permute, built directly in
+            # ``cfg.layout_w_scale`` (the MFMA scale VGPR layout) so the
+            # result feeds straight into mfma_scaled. ``SCALE_N_PAD`` is the
+            # padded scale col count; K%256==0 => no col padding => it is
+            # exactly K//SCALE_BLOCK (asserted host-side). K-step is 256
+            # elements per BLOCK_K iter (BLOCK_K_SCALE=8 -> one shuffle
+            # k-block). See ScaleVgprDescriptor / numerical check.
+            gl.static_assert(
+                BLOCK_K_SCALE == 8,
+                "sibling B-scale VGPR path assumes BLOCK_K_SCALE=8 "
+                "(BLOCK_K=256); re-derive the K-step/lane folding otherwise.",
+            )
+            # Runtime (K is a kernel arg): padded scale col count == K//32
+            # since K%256==0 (asserted host-side) leaves no col padding.
+            SCALE_N_PAD = K // cfg.SCALE_BLOCK
+            ws_n_sib = (
+                off_n
+                + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(1, cfg.layout_w_scale))
+            ).to(gl.uint32)
+            ws_k_sib = gl.arange(
+                0, BLOCK_K_SCALE, layout=gl.SliceLayout(0, cfg.layout_w_scale)
+            ).to(gl.uint32)
+            ws_n_part = (
+                (ws_n_sib // 32) * (SCALE_N_PAD * 32)
+                + (ws_n_sib % 16) * 4
+                + (ws_n_sib % 32) // 16
+            )
+            ws_k_lane = (ws_k_sib % 4) * 64 + (ws_k_sib // 4) * 2
+            ws_offsets = gl.expand_dims(ws_n_part, 1) + gl.expand_dims(ws_k_lane, 0)
+            w_scale_desc = ScaleVgprDescriptor(
+                cfg,
+                w_scale_ptr + ws_base_offset,
+                ws_offsets,
+                K_STEP=256,
+            )
+        elif cfg.SCALE_VIA_LDS:
             BLOCK_N_PS: gl.constexpr = cfg.BLOCK_N_PRESHUFFLED
             BLOCK_K_S_PS_W: gl.constexpr = cfg.BLOCK_K_SCALE_PRESHUFFLED
             LW_S: gl.constexpr = cfg.load_layout_w_scale
@@ -3216,6 +3473,8 @@ def _pipelined_moe_kernel_scaled(
     XCD_SWIZZLE: gl.constexpr = 1,
     W_VIA_VGPR: gl.constexpr = False,
     W_PREFETCH: gl.constexpr = True,
+    W_VIA_VGPR_SIBLING: gl.constexpr = False,
+    SCALE_VIA_VGPR_SIBLING: gl.constexpr = False,
 ):
     if GRID_N > 0:
         grid_n: gl.constexpr = GRID_N
@@ -3318,6 +3577,8 @@ def _pipelined_moe_kernel_scaled(
                 HAS_FP8_QUANT_OUT=HAS_FP8_QUANT_OUT,
                 W_VIA_VGPR=W_VIA_VGPR,
                 W_PREFETCH=W_PREFETCH,
+                W_VIA_VGPR_SIBLING=W_VIA_VGPR_SIBLING,
+                SCALE_VIA_VGPR_SIBLING=SCALE_VIA_VGPR_SIBLING,
             )
 
 
@@ -3556,6 +3817,19 @@ def _launch_kernel(
         K_w_phys, N_w_phys = w.shape
         E = 1
     K_w = K_w_phys * div_w
+    w_via_vgpr_sibling = bool(
+        w_preshuffle and getattr(w, "is_shuffled_for_gluon_sibling", False)
+    )
+    # Phase-2: the sibling B-scale VGPR path needs both the sibling W-data
+    # path AND an e8m0_shuffle'd W-scale tagged by
+    # ``shuffle_w_scale_for_gluon_sibling``. When active the kernel reads
+    # the shuffled scale directly via buffer_load (no LDS, no host
+    # re-preprocess) and forces SCALE_VIA_LDS off.
+    scale_via_vgpr_sibling = bool(
+        w_via_vgpr_sibling
+        and has_w_block_scale
+        and getattr(w_scale, "is_e8m0_shuffled_for_gluon_sibling", False)
+    )
     if w_preshuffle and getattr(w, "is_shuffled_for_gluon_dot", False):
         # Host pre-shuffle zero-pads K_pk to a multiple of 128 and W
         # scale to padded N (combine launcher trims output back).
@@ -3688,7 +3962,25 @@ def _launch_kernel(
         # N-contig W staged as [BK, BN] in LDS.
         stride_wn, stride_wk = w3.stride(-1), w3.stride(-2)
 
-    if has_w_block_scale:
+    if has_w_block_scale and scale_via_vgpr_sibling:
+        # Already e8m0_shuffle'd (E, N, K//32) contiguous; the kernel
+        # consumes it via closed-form buffer_load offsets. No host
+        # preprocess. K%256==0 => no scale-col padding => the kernel's
+        # stride_se_n_pad == K//32 holds (assert it here).
+        w_scale3 = w_scale if w_scale.ndim == 3 else w_scale.unsqueeze(0)
+        k_scale = K // 32
+        assert k_scale % 8 == 0, (
+            f"sibling B-scale VGPR path needs K//32 ({k_scale}) divisible by 8 "
+            f"(K%256==0) so the e8m0_shuffle has no column padding"
+        )
+        assert w_scale3.shape[-1] == k_scale and w_scale3.is_contiguous(), (
+            "sibling B-scale must be a contiguous (E, N, K//32) e8m0_shuffle "
+            f"tensor; got shape {tuple(w_scale3.shape)}"
+        )
+        stride_wse = w_scale3.stride(0)
+        stride_wsn, stride_wsk = w_scale3.stride(1), w_scale3.stride(2)
+        w_scale_buf = w_scale3
+    elif has_w_block_scale:
         w_scale3 = w_scale if w_scale.ndim == 3 else w_scale.unsqueeze(0)
         w_scale_proc3 = _preprocess_scale(w_scale3, scale_load_mode)
         stride_wse = w_scale_proc3.stride(0)
@@ -3827,6 +4119,8 @@ def _launch_kernel(
         USE_SLICE_N=use_slice_n,
         HAS_FP8_QUANT_OUT=has_fp8_quant_out,
         W_VIA_VGPR=w_preshuffle,
+        W_VIA_VGPR_SIBLING=w_via_vgpr_sibling,
+        SCALE_VIA_VGPR_SIBLING=scale_via_vgpr_sibling,
         W_PREFETCH=False,
         GRID_N=grid_n,
         GROUP_M=group_m,
