@@ -163,6 +163,18 @@ _GLUON_DOT_SUB_TILE_K = _GLUON_DOT_K_QUAD * _GLUON_DOT_K_WIDTH  # = 64
 _TCP_INFLIGHT_CAP_BYTES = 32 * 1024  # gfx9 L1/TCP per-CU in-flight cap
 _CDNA4_NUM_XCDS = 8  # MI355X has 8 XCDs (chiplets) per device.
 
+# [perf] Wide-store epilogue toggle. In its in-place SwiGLU split layout the
+# output leaves only ~2 contiguous elems/lane, so the epilogue store lowers to
+# a narrow `global_store_short` (b16). Re-distributing `out` through a
+# contiguous-N BlockedLayout (each lane owns the widest b128-capped run of N)
+# coalesces it to wider stores (`global_store_dword`/`_dwordx4`) with fewer
+# store instructions -- a prefill (large-M) win. TS_WIDE_STORE=0 reverts.
+# Must be a triton constexpr so it is readable from within @gluon.jit.
+_WIDE_STORE = gl.constexpr(
+    os.environ.get("TS_WIDE_STORE", "1").strip().lower()
+    not in ("0", "false", "no", "off")
+)
+
 
 def shuffle_weight_for_gluon_dot_layout(
     w: torch.Tensor,
@@ -293,6 +305,34 @@ def _store_layout(num_warps: int, block_m: int = 0, w_via_vgpr: bool = False):
         warps_m = 2 if num_warps >= 4 else 1
     warps_n = num_warps // warps_m
     return gl.BlockedLayout([1, 8], [2, 32], [warps_m, warps_n], [1, 0])
+
+
+@gluon.constexpr_function
+def _wide_store_layout(num_warps: int, block_m: int, out_block_n: int, elem_bits: int):
+    # Widest contiguous-N store layout for the epilogue. Each lane owns a run
+    # of N capped so spt_n * elem_bits <= 128 (one b128 store) and bounded by
+    # the per-thread element budget of the (block_m x out_block_n) tile. Waves
+    # are placed on M first (warps_n minimal), mirroring the sibling
+    # gluon_mxfp4_moe stage2_1x2 store_layout (size_per_thread=[4, 8],
+    # warps_per_cta=[4, 1]): keeping N inside a single wave is what lets the
+    # contiguous run coalesce. order=[1, 0] keeps N the fastest-varying axis.
+    LANES = 64
+    vec_cap = max(1, 128 // elem_bits)
+    total_threads = num_warps * LANES
+    budget = max(1, (block_m * out_block_n) // total_threads)
+    spt_n = min(vec_cap, out_block_n, budget)
+    while out_block_n % spt_n != 0:
+        spt_n -= 1
+    lanes_n = min(LANES, out_block_n // spt_n)
+    lanes_m = max(1, LANES // lanes_n)
+    warps_m = max(1, min(num_warps, block_m // max(1, lanes_m)))
+    while num_warps % warps_m != 0:
+        warps_m -= 1
+    warps_n = num_warps // warps_m
+    spt_m = max(1, block_m // (warps_m * lanes_m))
+    return gl.BlockedLayout(
+        [spt_m, spt_n], [lanes_m, lanes_n], [warps_m, warps_n], [1, 0]
+    )
 
 
 @gluon.constexpr_function
@@ -2985,7 +3025,21 @@ def _pipelined_moe_tile_compute(
             scale = gl.load(out_quant_scale_ptr).to(gl.float32)
             out = out / scale
         out = out.to(y_ptr.dtype.element_ty)
-        STORE_LAYOUT: gl.constexpr = out.type.layout
+        if _WIDE_STORE:
+            # Re-distribute the SwiGLU output so each lane owns the widest
+            # contiguous N run (b128-capped). The in-place swiglu split layout
+            # leaves only ~2 contiguous fp8 elems/lane -> the store lowers to
+            # global_store_short; this widens it to global_store_dword(x4).
+            # The offset/mask arithmetic below keys off STORE_LAYOUT so it
+            # adapts automatically.
+            OUT_ELEM_BITS: gl.constexpr = y_ptr.dtype.element_ty.primitive_bitwidth
+            WIDE_STORE_LAYOUT: gl.constexpr = _wide_store_layout(
+                NUM_WARPS, BLOCK_M, OUT_BLOCK_N, OUT_ELEM_BITS
+            )
+            out = gl.convert_layout(out, WIDE_STORE_LAYOUT)
+            STORE_LAYOUT: gl.constexpr = WIDE_STORE_LAYOUT
+        else:
+            STORE_LAYOUT: gl.constexpr = out.type.layout
     else:
         out = acc.to(y_ptr.dtype.element_ty)
         STORE_LAYOUT: gl.constexpr = STORE
