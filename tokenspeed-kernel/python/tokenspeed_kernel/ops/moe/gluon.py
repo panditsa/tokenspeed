@@ -1439,6 +1439,48 @@ class MoEPipelinedProgram:
         )
 
     @gluon.jit
+    def _issue_wb_vgpr(self, mfma_idx):
+        # Prefetch B-data and B-scale for the SAME tile back-to-back so
+        # b[i+1] and b_scale[i+1] are issued together (mirrors
+        # gluon_mxfp4_gemm unroll4's _load_b_vgpr_pair). Keeping the pair
+        # adjacent lets the two buffer_loads co-schedule one K-step ahead.
+        cfg = self.cfg
+        w = self.w_desc.issue_global_load_to_vgpr(mfma_idx, cfg.dot_layout_w)
+        sw = self.w_scale_desc.issue_global_load_to_vgpr(mfma_idx)
+        return w, sw
+
+    @gluon.jit
+    def _load_x_xscale(self, mfma_idx):
+        # x (A activation from LDS) + x-scale only; the W-scale is prefetched
+        # separately by the caller (SCALE_PREFETCH path).
+        cfg = self.cfg
+        x = self.x_desc.issue_local_load(mfma_idx, self.x_buffer, cfg.dot_layout_x)
+        BLOCK_K_SCALE: gl.constexpr = cfg.BLOCK_K // cfg.SCALE_BLOCK
+        if cfg.USE_MFMA_SCALED:
+            if cfg.WITH_X_MX_SCALE:
+                if cfg.SCALE_VIA_LDS:
+                    scale_x = self.x_scale_desc.issue_local_load_unswizzle(
+                        mfma_idx,
+                        self.x_scale_buffer,
+                        cfg.layout_x_scale,
+                        cfg.BLOCK_M_PRESHUFFLED,
+                        cfg.BLOCK_M,
+                        BLOCK_K_SCALE,
+                    )
+                else:
+                    scale_x = _load_scale_tile_via_gl_load(self.x_scale_desc, mfma_idx)
+            else:
+                scale_x = gl.full(
+                    [cfg.BLOCK_M, BLOCK_K_SCALE],
+                    127,
+                    gl.uint8,
+                    layout=cfg.layout_x_scale,
+                )
+        else:
+            scale_x: gl.constexpr = 0
+        return x, scale_x
+
+    @gluon.jit
     def _load_xw(self, mfma_idx):
         cfg = self.cfg
         x = self.x_desc.issue_local_load(
@@ -1582,12 +1624,20 @@ class MoEPipelinedProgram:
         K_iters = gl.cdiv(loop_k, cfg.BLOCK_K)
 
         W_PREFETCH: gl.constexpr = cfg.W_VIA_VGPR and cfg.W_PREFETCH
+        # Also prefetch the sibling B-scale (the ATT bottleneck: it was issued
+        # synchronously at the current K-index and dominated the vmcnt(0) drain).
+        # B-scale rides with W: when W is prefetched and the scale is the
+        # sibling VGPR path, prefetch b_scale[i+1] together with b[i+1].
+        SCALE_PREFETCH: gl.constexpr = W_PREFETCH and cfg.SCALE_VIA_VGPR_SIBLING
 
         for _ in gl.static_range(cfg.NUM_BUFFERS - 1):
             load_idx = self.issue_global_loads(load_idx, USE_MASK=0)
 
         if W_PREFETCH:
-            w_curr = self._issue_w_vgpr(0)
+            if SCALE_PREFETCH:
+                w_curr, sw_curr = self._issue_wb_vgpr(0)
+            else:
+                w_curr = self._issue_w_vgpr(0)
 
         # EVEN_K: K_iters - (NUM_BUFFERS-1) all-unmasked main iters.
         # !EVEN_K: one less unmasked iter; the last is the masked tail below.
@@ -1599,9 +1649,15 @@ class MoEPipelinedProgram:
             self.async_wait(cfg.NUM_BUFFERS - 1)
 
             if W_PREFETCH:
-                x, scale_x, scale_w = self._load_x_scales(mfma_idx)
-                accumulator = self.mfma(x, scale_x, w_curr, scale_w, accumulator)
-                w_curr = self._issue_w_vgpr(mfma_idx + 1)
+                if SCALE_PREFETCH:
+                    x, scale_x = self._load_x_xscale(mfma_idx)
+                    accumulator = self.mfma(x, scale_x, w_curr, sw_curr, accumulator)
+                    # b[i+1] + b_scale[i+1] prefetched together
+                    w_curr, sw_curr = self._issue_wb_vgpr(mfma_idx + 1)
+                else:
+                    x, scale_x, scale_w = self._load_x_scales(mfma_idx)
+                    accumulator = self.mfma(x, scale_x, w_curr, scale_w, accumulator)
+                    w_curr = self._issue_w_vgpr(mfma_idx + 1)
             else:
                 x, w, scale_x, scale_w = self.issue_local_loads(mfma_idx)
                 accumulator = self.mfma(x, scale_x, w, scale_w, accumulator)
@@ -1612,9 +1668,15 @@ class MoEPipelinedProgram:
             load_idx = self.issue_global_loads(load_idx, USE_MASK=1)
             self.async_wait(cfg.NUM_BUFFERS - 1)
             if W_PREFETCH:
-                x, scale_x, scale_w = self._load_x_scales(mfma_idx)
-                accumulator = self.mfma(x, scale_x, w_curr, scale_w, accumulator)
-                w_curr = self._issue_w_vgpr(mfma_idx + 1)
+                if SCALE_PREFETCH:
+                    x, scale_x = self._load_x_xscale(mfma_idx)
+                    accumulator = self.mfma(x, scale_x, w_curr, sw_curr, accumulator)
+                    # b[i+1] + b_scale[i+1] prefetched together
+                    w_curr, sw_curr = self._issue_wb_vgpr(mfma_idx + 1)
+                else:
+                    x, scale_x, scale_w = self._load_x_scales(mfma_idx)
+                    accumulator = self.mfma(x, scale_x, w_curr, scale_w, accumulator)
+                    w_curr = self._issue_w_vgpr(mfma_idx + 1)
             else:
                 x, w, scale_x, scale_w = self.issue_local_loads(mfma_idx)
                 accumulator = self.mfma(x, scale_x, w, scale_w, accumulator)
@@ -1624,10 +1686,17 @@ class MoEPipelinedProgram:
         for i in gl.static_range(cfg.NUM_BUFFERS - 1):
             self.async_wait(cfg.NUM_BUFFERS - 2 - i)
             if W_PREFETCH:
-                x, scale_x, scale_w = self._load_x_scales(mfma_idx)
-                accumulator = self.mfma(x, scale_x, w_curr, scale_w, accumulator)
-                if i < cfg.NUM_BUFFERS - 2:
-                    w_curr = self._issue_w_vgpr(mfma_idx + 1)
+                if SCALE_PREFETCH:
+                    x, scale_x = self._load_x_xscale(mfma_idx)
+                    accumulator = self.mfma(x, scale_x, w_curr, sw_curr, accumulator)
+                    if i < cfg.NUM_BUFFERS - 2:
+                        # b[i+1] + b_scale[i+1] prefetched together
+                        w_curr, sw_curr = self._issue_wb_vgpr(mfma_idx + 1)
+                else:
+                    x, scale_x, scale_w = self._load_x_scales(mfma_idx)
+                    accumulator = self.mfma(x, scale_x, w_curr, scale_w, accumulator)
+                    if i < cfg.NUM_BUFFERS - 2:
+                        w_curr = self._issue_w_vgpr(mfma_idx + 1)
             else:
                 x, w, scale_x, scale_w = self.issue_local_loads(mfma_idx)
                 accumulator = self.mfma(x, scale_x, w, scale_w, accumulator)
