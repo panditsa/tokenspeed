@@ -352,22 +352,41 @@ def shuffle_weight_for_gluon_sibling(
     return out
 
 
+def _e8m0_shuffle_opsel_b(scale: torch.Tensor) -> torch.Tensor:
+    """e8m0 B-scale shuffle whose dword byte order matches stock op_sel.
+
+    Identical to gluon_mxfp4_gemm's ``e8m0_shuffle_opsel_b`` (the reference
+    ``mxfp4_aiter_opt_inner_aligned_unroll4`` kernel). Unlike aiter's plain
+    ``e8m0_shuffle`` (``//32`` row term, K-step 256), this ``//128`` /
+    K-step-1024 layout makes the kernel's per-thread ``buffer_load`` scale
+    bytes contiguous, so they coalesce to ``dword`` (no ``buffer_load_ubyte``).
+    """
+    assert scale.dtype == torch.uint8 and scale.ndim == 2
+    rows, k_scale = scale.shape
+    rows_pad = (rows + 255) // 256 * 256
+    k_scale_pad = (k_scale + 7) // 8 * 8
+    padded = torch.zeros(
+        (rows_pad, k_scale_pad), dtype=scale.dtype, device=scale.device
+    )
+    padded[:rows, :k_scale] = scale
+    out = padded.view(rows_pad // 128, 2, 4, 16, k_scale_pad // 8, 2, 4)
+    out = out.permute(0, 4, 6, 2, 3, 1, 5).contiguous()
+    return out.view(rows_pad, k_scale_pad)
+
+
 def shuffle_w_scale_for_gluon_sibling(w_scale: torch.Tensor) -> torch.Tensor:
     """e8m0_shuffle the W block-scale for the sibling B-scale VGPR path.
 
-    Input is the raw e8m0 scale ``(E, N, K//32)`` uint8. We apply aiter's
-    ``e8m0_shuffle`` (``shuffle_scale``: pad rows->mult256 / cols->mult8,
-    then a (m,n) reshape+permute) over the flattened ``(E*N, K//32)`` rows,
-    exactly like gluon-kernels' bench
-    (``e8m0_shuffle(s.view(E*N, K_scale)).view(E, N, K_scale)``), and view
-    back to ``(E, N, K//32)``. The kernel's closed-form ``buffer_load``
-    offsets (``ScaleVgprDescriptor``) invert this layout.
+    Input is the raw e8m0 scale ``(E, N, K//32)`` uint8. We apply the
+    ``opsel_b`` e8m0 shuffle (``//128`` / K-step-1024 layout) over the
+    flattened ``(E*N, K//32)`` rows and view back to ``(E, N, K//32)``.
+    The kernel's closed-form ``buffer_load`` offsets (``ScaleVgprDescriptor``)
+    invert this layout; the opsel_b layout yields contiguous per-thread
+    scale bytes so the load coalesces to ``dword`` (no ``ubyte``).
 
     Requires ``E*N % 256 == 0`` and ``(K//32) % 8 == 0`` so the shuffle
     introduces no padding and the view-back is exact; raise otherwise.
     """
-    from aiter.utility.fp4_utils import e8m0_shuffle
-
     ws = w_scale if w_scale.ndim == 3 else w_scale.unsqueeze(0)
     if ws.dtype != torch.uint8:
         raise ValueError(f"w_scale must be uint8 e8m0, got {ws.dtype}")
@@ -382,7 +401,7 @@ def shuffle_w_scale_for_gluon_sibling(w_scale: torch.Tensor) -> torch.Tensor:
             f"sibling scale shuffle requires K//32 multiple of 8 "
             f"(got {K_scale}); needs K % 256 == 0."
         )
-    sh = e8m0_shuffle(ws.reshape(E * N, K_scale).contiguous())
+    sh = _e8m0_shuffle_opsel_b(ws.reshape(E * N, K_scale).contiguous())
     if tuple(sh.shape) != (E * N, K_scale):
         raise RuntimeError(
             f"e8m0_shuffle padded the scale to {tuple(sh.shape)}; expected "
@@ -398,12 +417,23 @@ def shuffle_w_scale_for_gluon_sibling(w_scale: torch.Tensor) -> torch.Tensor:
 # ---------------------------------------------------------------------------
 
 
+# W-VGPR MFMA warp split: 2 -> [2,2] (default), 1 -> [1,4] (opsel_b scale
+# coalesces to dword). Read once at import (gluon constexpr_functions cannot
+# call os.environ.get at trace time); each subprocess picks it up fresh.
+_VGPR_WARPS_M = int(os.environ.get("TS_VGPR_WARPS_M", "2"))
+
+# Software-prefetch the W (and scale) VGPR tiles one K-step ahead so the
+# global-load latency overlaps the MFMA (the LDS path gets this for free via
+# async double-buffering). Off by default; toggle for A/B perf measurement.
+_W_PREFETCH = os.environ.get("TS_W_PREFETCH", "0") == "1"
+
+
 @gluon.constexpr_function
 def _store_layout(num_warps: int, block_m: int = 0, w_via_vgpr: bool = False):
     # Mirrors the warps_m policy in get_mfma_layout so the MFMA acc
     # and store layouts stay convert-compatible.
     if w_via_vgpr and num_warps >= 4:
-        warps_m = 2
+        warps_m = _VGPR_WARPS_M  # 1=[1,4] dword scale, 2=[2,2]
     elif block_m and block_m <= 32 and num_warps >= 4:
         warps_m = 1
     else:
@@ -537,7 +567,10 @@ def get_mfma_layout(
     # ``warps_m=1`` to keep the fundamental block from over-filling M.
     assert num_warps in (4, 8), "MI355 MoE kernel currently supports 4 or 8 warps."
     if w_via_vgpr and num_warps >= 4:
-        warps_m = 2
+        # _VGPR_WARPS_M=1 -> [1,4] split: opsel_b scale coalesces to dword.
+        # Valid for the SIBLING path (non-trivial W convert); SIBLING=False
+        # PR-preshuffle assert_trivial convert needs warps_m=2. Default 2.
+        warps_m = _VGPR_WARPS_M
     elif block_m and block_m <= 32 and num_warps >= 4:
         warps_m = 1
     else:
@@ -1243,12 +1276,13 @@ class ScaleVgprDescriptor:
     directly in ``cfg.layout_w_scale`` (the MFMA scale VGPR layout) so the
     ``buffer_load`` result feeds straight into ``mfma_scaled`` with no
     reshape/convert. The per-K-iter advance is the constexpr
-    ``K_STEP`` (= 256 elements for BLOCK_K_SCALE=8); the lane- and
+    ``K_STEP`` (= 1024 elements for BLOCK_K_SCALE=8); the lane- and
     N-only piece is folded into ``offsets``. Mirrors gluon-kernels'
-    ``_load_b_scale_vgpr`` (stage1_kernel.py ~148) but for the plain
-    ``shuffle_scale`` layout (not the opsel_b variant), so the row term
-    is ``(n//32)*(stride_se_n_pad*32) + (n%16)*4 + (n%32)//16`` and the
-    K-step is 256 rather than 1024.
+    ``_load_b_scale_vgpr`` (stage1_kernel.py ~148) using the ``opsel_b``
+    layout, so the row term is ``(n//128)*(stride_se_n_pad*128) +
+    ((n%64)//16)*64 + (n%16)*4 + ((n%128)//64)*2`` and the K-step is 1024.
+    This makes the per-thread ``buffer_load`` scale bytes contiguous so
+    they coalesce to ``dword`` (no ``buffer_load_ubyte``).
     """
 
     cfg: MoEConfig
@@ -2861,7 +2895,7 @@ def _pipelined_moe_tile_compute(
             # ``cfg.layout_w_scale`` (the MFMA scale VGPR layout) so the
             # result feeds straight into mfma_scaled. ``SCALE_N_PAD`` is the
             # padded scale col count; K%256==0 => no col padding => it is
-            # exactly K//SCALE_BLOCK (asserted host-side). K-step is 256
+            # exactly K//SCALE_BLOCK (asserted host-side). K-step is 1024
             # elements per BLOCK_K iter (BLOCK_K_SCALE=8 -> one shuffle
             # k-block). See ScaleVgprDescriptor / numerical check.
             gl.static_assert(
@@ -2879,18 +2913,23 @@ def _pipelined_moe_tile_compute(
             ws_k_sib = gl.arange(
                 0, BLOCK_K_SCALE, layout=gl.SliceLayout(0, cfg.layout_w_scale)
             ).to(gl.uint32)
+            # opsel_b layout (matches _e8m0_shuffle_opsel_b host shuffle):
+            # the //128 row term + K-step 1024 yield per-thread CONTIGUOUS
+            # scale bytes so the buffer_load coalesces to dword (no ubyte).
+            # Mirrors gluon_mxfp4_gemm _load_b_scale_vgpr (reference unroll4).
             ws_n_part = (
-                (ws_n_sib // 32) * (SCALE_N_PAD * 32)
+                (ws_n_sib // 128) * (SCALE_N_PAD * 128)
+                + ((ws_n_sib % 64) // 16) * 64
                 + (ws_n_sib % 16) * 4
-                + (ws_n_sib % 32) // 16
+                + ((ws_n_sib % 128) // 64) * 2
             )
-            ws_k_lane = (ws_k_sib % 4) * 64 + (ws_k_sib // 4) * 2
+            ws_k_lane = (ws_k_sib % 4) * 256 + (ws_k_sib % 8) // 4
             ws_offsets = gl.expand_dims(ws_n_part, 1) + gl.expand_dims(ws_k_lane, 0)
             w_scale_desc = ScaleVgprDescriptor(
                 cfg,
                 w_scale_ptr + ws_base_offset,
                 ws_offsets,
-                K_STEP=256,
+                K_STEP=1024,
             )
         elif cfg.SCALE_VIA_LDS:
             BLOCK_N_PS: gl.constexpr = cfg.BLOCK_N_PRESHUFFLED
@@ -4121,7 +4160,7 @@ def _launch_kernel(
         W_VIA_VGPR=w_preshuffle,
         W_VIA_VGPR_SIBLING=w_via_vgpr_sibling,
         SCALE_VIA_VGPR_SIBLING=scale_via_vgpr_sibling,
-        W_PREFETCH=False,
+        W_PREFETCH=_W_PREFETCH,
         GRID_N=grid_n,
         GROUP_M=group_m,
         XCD_SWIZZLE=xcd_swizzle,
