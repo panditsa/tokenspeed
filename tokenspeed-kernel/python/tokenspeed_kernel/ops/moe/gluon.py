@@ -175,6 +175,26 @@ _WIDE_STORE = gl.constexpr(
     not in ("0", "false", "no", "off")
 )
 
+# [sibling-mask] When on, the sibling VGPR MoE GEMM path MASKS the K-tail and
+# N (like the default LDS path) instead of requiring option-C zero-padding
+# (K->mult256, N->mult block_n). The sibling W-DATA buffer_load gets a
+# per-element (k<k_limit & n<N) mask so it accepts an unpadded W tile
+# (K_pk=K//2, N) and zeros the OOB tail; the sibling W-SCALE stays opsel-
+# shuffled with N padded to a 128-multiple (a one-time weight prep, NOT a
+# per-forward pad) so its per-expert closed-form addressing holds, and the
+# kernel reads SCALE_N_PAD=roundup(K//32,8) cols (the opsel K-pad). This
+# removes the per-forward activation/intermediate F.pad "pad-glue". Default
+# OFF = byte-identical padded behavior. Must be a triton constexpr so it is
+# readable from within @gluon.jit; read once at import (gluon
+# constexpr_functions cannot call os.environ at trace time).
+_SIBLING_MASK_ENV = os.environ.get("TS_SIBLING_MASK", "0").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+_SIBLING_MASK = gl.constexpr(_SIBLING_MASK_ENV)
+
 
 def shuffle_weight_for_gluon_dot_layout(
     w: torch.Tensor,
@@ -331,12 +351,26 @@ def shuffle_weight_for_gluon_sibling(
     """
     w3 = w if w.ndim == 3 else w.unsqueeze(0)
     E, K_pk, N = w3.shape
-    if N % block_n != 0:
+    if _SIBLING_MASK_ENV:
+        # Masked sibling path: the W-data is loaded per-element-masked
+        # (k<k_limit & n<N) so the only host constraint is the underlying
+        # (16,16) rearrange (_b_preshuffle_3d_sibling): N%16==0, K_pk%32==0.
+        # No K/N tail padding -- the kernel masks both tails.
+        if N % 16 != 0:
+            raise ValueError(
+                f"masked sibling preshuffle requires N divisible by 16 " f"(got N={N})."
+            )
+        if K_pk % 32 != 0:
+            raise ValueError(
+                f"masked sibling preshuffle requires K_pk multiple of 32 "
+                f"(got K_pk={K_pk})."
+            )
+    elif N % block_n != 0:
         raise ValueError(
             f"sibling preshuffle requires N divisible by block_n={block_n} "
             f"(got N={N}); pad W + W-scale upstream."
         )
-    if K_pk % 128 != 0:
+    elif K_pk % 128 != 0:
         raise ValueError(
             f"sibling preshuffle requires K_pk multiple of 128 (got {K_pk}); "
             f"pad W upstream."
@@ -1204,9 +1238,14 @@ class WVgprDescriptor:
     stride_k: gl.tensor  # = N (bytes between consecutive K-slabs)
     offsets: gl.tensor  # [LOAD_BN//N_LANE, BLOCK_K*N_LANE]
     pred: gl.tensor  # int1 scalar (broadcast to a per-element mask)
+    # [sibling-mask] per-element tail-mask inputs (MASK_TAIL only):
+    off_k: gl.tensor | gl.constexpr  # per-elem packed-k coords (SliceLayout(1))
+    k_limit: gl.tensor | gl.constexpr  # logical packed-K limit (= K//DIV_FACTOR_W)
+    n_mask: gl.tensor | gl.constexpr  # per-elem n-in-bounds bool (SliceLayout(0))
     BLOCK_K: gl.constexpr  # = BLOCK_K_W; mirrors AsyncCopyDescriptor
     LOAD_BN: gl.constexpr  # N width per load; SUB_BN under sliceN
     SIBLING: gl.constexpr  # gluon-kernels (16,16) closed-form offsets
+    MASK_TAIL: gl.constexpr  # build per-element (k<k_limit & n<N) load mask
 
     @gluon.constexpr_function
     def __init__(
@@ -1219,15 +1258,23 @@ class WVgprDescriptor:
         pred,
         LOAD_BN=None,
         SIBLING=False,
+        off_k=None,
+        k_limit=None,
+        n_mask=None,
+        MASK_TAIL=False,
     ):
         self.cfg = cfg
         self.BLOCK_K = gl.constexpr(BLOCK_K)
         self.LOAD_BN = gl.constexpr(LOAD_BN if LOAD_BN is not None else cfg.BLOCK_N)
         self.SIBLING = gl.constexpr(SIBLING)
+        self.MASK_TAIL = gl.constexpr(MASK_TAIL)
         self.ptr = ptr
         self.stride_k = stride_k
         self.offsets = offsets
         self.pred = pred
+        self.off_k = off_k if off_k is not None else gl.constexpr(0)
+        self.k_limit = k_limit if k_limit is not None else gl.constexpr(0)
+        self.n_mask = n_mask if n_mask is not None else gl.constexpr(0)
 
     @gluon.jit
     def issue_global_load_to_vgpr(self, idx, dot_layout: gl.constexpr):
@@ -1242,9 +1289,26 @@ class WVgprDescriptor:
         # ``mask`` is a scalar bool; buffer_load broadcasts it to the
         # offsets layout. Hardware OOB masking returns 0 for masked
         # lanes, which is what we want when ``pred=False``.
-        tile_flat = gl.amd.cdna4.buffer_load(
-            ptr=ptr_iter, offsets=self.offsets, mask=self.pred
-        )
+        if self.MASK_TAIL:
+            # [sibling-mask] Per-element K-tail + N mask (mirrors the
+            # default AsyncCopyDescriptor.issue_async_load !EVEN_K path),
+            # so an UNPADDED W tile (K_pk=K//2, N) is accepted: lanes with
+            # packed-k >= k_limit or n >= N are zeroed instead of read OOB.
+            # ``off_k`` / ``n_mask`` were built in the same SliceLayouts the
+            # closed-form ``offsets`` use, so the mask broadcasts elementwise
+            # onto the [BLOCK_K_W, BLOCK_N] load. Do NOT pass ``other=0`` --
+            # we rely on the buffer-descriptor OOB to zero masked lanes.
+            k_coord = idx * BLOCK_K_W + self.off_k
+            mask = gl.expand_dims(k_coord < self.k_limit, 1) & gl.expand_dims(
+                self.n_mask, 0
+            )
+            tile_flat = gl.amd.cdna4.buffer_load(
+                ptr=ptr_iter, offsets=self.offsets, mask=mask
+            )
+        else:
+            tile_flat = gl.amd.cdna4.buffer_load(
+                ptr=ptr_iter, offsets=self.offsets, mask=self.pred
+            )
 
         if self.SIBLING:
             # gluon-kernels path: ``offsets`` were built directly in
@@ -2864,15 +2928,37 @@ def _pipelined_moe_tile_compute(
         offsets_sib = gl.expand_dims(b_k_part, 1) + gl.expand_dims(b_n_part, 0)
         # K-iter advance must be (BLOCK_K_W//32)*512 = BLOCK_K_W*16, so
         # pass stride_k=16 (idx * BLOCK_K_W * 16).
-        w_desc = WVgprDescriptor(
-            cfg,
-            BLOCK_K_W,
-            w_ptr,
-            gl.to_tensor(16),
-            offsets_sib + w_base_offset,
-            pred=gl.to_tensor(True),
-            SIBLING=True,
-        )
+        if _SIBLING_MASK:
+            # [sibling-mask] Hand the descriptor the per-element packed-k
+            # coords (``offs_bk_s``, SliceLayout(1)) and the per-element
+            # n-in-bounds mask (``offs_bn_s < N``, SliceLayout(0)) -- the
+            # SAME element layouts ``offsets_sib`` is built from -- plus the
+            # logical packed-K limit. The descriptor masks each K-iter so
+            # an UNPADDED W (K_pk=K//DIV_FACTOR_W, N) loads with the K-tail
+            # and OOB-N columns zeroed (bit-exact vs the padded path).
+            w_desc = WVgprDescriptor(
+                cfg,
+                BLOCK_K_W,
+                w_ptr,
+                gl.to_tensor(16),
+                offsets_sib + w_base_offset,
+                pred=gl.to_tensor(True),
+                SIBLING=True,
+                off_k=offs_bk_s,
+                k_limit=gl.to_tensor(K_PK_TOTAL),
+                n_mask=offs_bn_s < N,
+                MASK_TAIL=True,
+            )
+        else:
+            w_desc = WVgprDescriptor(
+                cfg,
+                BLOCK_K_W,
+                w_ptr,
+                gl.to_tensor(16),
+                offsets_sib + w_base_offset,
+                pred=gl.to_tensor(True),
+                SIBLING=True,
+            )
     elif cfg.W_VIA_VGPR:
         # Host-preshuffled W -> VGPR direct; bypasses LDS staging.
         TILE_BYTES: gl.constexpr = BLOCK_K_W * BLOCK_N
@@ -2992,7 +3078,14 @@ def _pipelined_moe_tile_compute(
             )
             # Runtime (K is a kernel arg): padded scale col count == K//32
             # since K%256==0 (asserted host-side) leaves no col padding.
-            SCALE_N_PAD = K // cfg.SCALE_BLOCK
+            # [sibling-mask] When K is NOT a multiple of 256, the opsel
+            # e8m0 shuffle pads K//32 up to a multiple of 8, so the shuffled
+            # scale row stride is roundup(K//32, 8); use that as SCALE_N_PAD.
+            # (When K%256==0 the roundup is a no-op -> byte-identical.)
+            if _SIBLING_MASK:
+                SCALE_N_PAD = (K // cfg.SCALE_BLOCK + 7) // 8 * 8
+            else:
+                SCALE_N_PAD = K // cfg.SCALE_BLOCK
             ws_n_sib = (
                 off_n
                 + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(1, cfg.layout_w_scale))
@@ -3984,7 +4077,19 @@ def _launch_kernel(
         and has_w_block_scale
         and getattr(w_scale, "is_e8m0_shuffled_for_gluon_sibling", False)
     )
-    if w_preshuffle and getattr(w, "is_shuffled_for_gluon_dot", False):
+    if w_via_vgpr_sibling and _SIBLING_MASK_ENV:
+        # Masked sibling path: W is host-shuffled UNPADDED (K_pk=K//2, N
+        # not block-aligned). The kernel masks the K-tail (k<k_limit) and
+        # N (n<N) on the W-data buffer_load, so no K%256 / N%block_n pad.
+        original_k_pk = getattr(w, "original_k_pk", K_w_phys)
+        assert (
+            K == original_k_pk * div_w == K_w_phys * div_w
+        ), f"masked sibling: A logical K={K} vs W K_pk={K_w_phys} (must be unpadded)"
+        assert (
+            K_w_phys % 32 == 0
+        ), f"masked sibling W K_pk ({K_w_phys}) must be a multiple of 32"
+        N = N_w_phys
+    elif w_preshuffle and getattr(w, "is_shuffled_for_gluon_dot", False):
         # Host pre-shuffle zero-pads K_pk to a multiple of 128 and W
         # scale to padded N (combine launcher trims output back).
         original_k_pk = getattr(w, "original_k_pk", K_w_phys)
@@ -4148,15 +4253,34 @@ def _launch_kernel(
         # preprocess. K%256==0 => no scale-col padding => the kernel's
         # stride_se_n_pad == K//32 holds (assert it here).
         w_scale3 = w_scale if w_scale.ndim == 3 else w_scale.unsqueeze(0)
-        k_scale = K // 32
-        assert k_scale % 8 == 0, (
-            f"sibling B-scale VGPR path needs K//32 ({k_scale}) divisible by 8 "
-            f"(K%256==0) so the e8m0_shuffle has no column padding"
-        )
-        assert w_scale3.shape[-1] == k_scale and w_scale3.is_contiguous(), (
-            "sibling B-scale must be a contiguous (E, N, K//32) e8m0_shuffle "
-            f"tensor; got shape {tuple(w_scale3.shape)}"
-        )
+        if _SIBLING_MASK_ENV:
+            # Masked sibling: scale is opsel-shuffled with K//32 padded up
+            # to a multiple of 8 (SCALE_N_PAD = roundup(K//32, 8)) and N
+            # padded to a 128-multiple (required by the FLAT E*N opsel
+            # per-expert addressing -- a one-time weight prep, not a
+            # per-forward pad). The kernel reads SCALE_N_PAD K-cols and the
+            # padded scale tail/N are don't-care wherever the W K/N tail is
+            # masked to zero.
+            k_scale_pad = ((K // 32) + 7) // 8 * 8
+            assert w_scale3.shape[-1] == k_scale_pad and w_scale3.is_contiguous(), (
+                "masked sibling B-scale must be a contiguous (E, N_pad, "
+                f"roundup(K//32,8)={k_scale_pad}) e8m0_shuffle tensor; got "
+                f"shape {tuple(w_scale3.shape)}"
+            )
+            assert w_scale3.shape[-2] % 128 == 0, (
+                "masked sibling B-scale N must be padded to a 128-multiple "
+                f"for opsel per-expert addressing; got {w_scale3.shape[-2]}"
+            )
+        else:
+            k_scale = K // 32
+            assert k_scale % 8 == 0, (
+                f"sibling B-scale VGPR path needs K//32 ({k_scale}) divisible by 8 "
+                f"(K%256==0) so the e8m0_shuffle has no column padding"
+            )
+            assert w_scale3.shape[-1] == k_scale and w_scale3.is_contiguous(), (
+                "sibling B-scale must be a contiguous (E, N, K//32) e8m0_shuffle "
+                f"tensor; got shape {tuple(w_scale3.shape)}"
+            )
         stride_wse = w_scale3.stride(0)
         stride_wsn, stride_wsk = w_scale3.stride(1), w_scale3.stride(2)
         w_scale_buf = w_scale3
