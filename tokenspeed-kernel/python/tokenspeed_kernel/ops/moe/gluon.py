@@ -427,6 +427,16 @@ _VGPR_WARPS_M = int(os.environ.get("TS_VGPR_WARPS_M", "2"))
 # async double-buffering). Off by default; toggle for A/B perf measurement.
 _W_PREFETCH = os.environ.get("TS_W_PREFETCH", "0") == "1"
 
+# Split-K (k_batch) for the small-M VGPR decode path. Each output tile is
+# computed by K_BATCH CTAs over disjoint K-slices that atomic-add their fp32
+# partials into the (pre-zeroed) output, multiplying the number of in-flight
+# wavefronts so the tiny decode grid can hide global-load latency. Default
+# 1 = OFF (byte-identical, no atomics). Only the plain (non-SwiGLU) GEMM
+# path supports it for now: SwiGLU is non-linear, so partial K-sums cannot be
+# fused (that needs a temp-buffer + combine pass -- option (a), future work).
+# Read once at import (gluon constexpr_functions cannot call os.environ).
+_K_BATCH = int(os.environ.get("TS_KBATCH", "1"))
+
 
 @gluon.constexpr_function
 def _store_layout(num_warps: int, block_m: int = 0, w_via_vgpr: bool = False):
@@ -1612,11 +1622,17 @@ class MoEPipelinedProgram:
         return x, w, scale_x, scale_w
 
     @gluon.jit
-    def pipeline(self, loop_k):
+    def pipeline(self, loop_k, k_tile_start=0):
         cfg = self.cfg
         EVEN_K: gl.constexpr = cfg.EVEN_K
-        load_idx = 0
-        mfma_idx = 0
+        # Split-K: begin the load/MFMA K-tile index at k_tile_start so this
+        # CTA covers the slice [k_tile_start, k_tile_start + cdiv(loop_k,
+        # BLOCK_K)). For k_tile_start=0 (default) this is byte-identical to
+        # the full-K path. The caller passes loop_k = K // K_BATCH and only
+        # uses this on the EVEN_K path (K % (BLOCK_K*K_BATCH) == 0), so every
+        # slice tile is full and the masked tail below is never taken.
+        load_idx = k_tile_start
+        mfma_idx = k_tile_start
 
         accumulator = gl.zeros(
             (cfg.BLOCK_M, cfg.BLOCK_N), dtype=gl.float32, layout=cfg.acc_layout
@@ -1635,9 +1651,9 @@ class MoEPipelinedProgram:
 
         if W_PREFETCH:
             if SCALE_PREFETCH:
-                w_curr, sw_curr = self._issue_wb_vgpr(0)
+                w_curr, sw_curr = self._issue_wb_vgpr(mfma_idx)
             else:
-                w_curr = self._issue_w_vgpr(0)
+                w_curr = self._issue_w_vgpr(mfma_idx)
 
         # EVEN_K: K_iters - (NUM_BUFFERS-1) all-unmasked main iters.
         # !EVEN_K: one less unmasked iter; the last is the masked tail below.
@@ -2582,6 +2598,7 @@ def _pipelined_moe_tile_compute(
     compact_idx,
     block_in_expert,
     pid_n,
+    kb,
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,
     BLOCK_K: gl.constexpr,
@@ -2615,6 +2632,7 @@ def _pipelined_moe_tile_compute(
     W_PREFETCH: gl.constexpr = True,
     W_VIA_VGPR_SIBLING: gl.constexpr = False,
     SCALE_VIA_VGPR_SIBLING: gl.constexpr = False,
+    K_BATCH: gl.constexpr = 1,
 ):
     expert_id = compact_idx
 
@@ -3393,6 +3411,15 @@ def _pipelined_moe_tile_compute(
         )
         if USE_WARP_PIPELINE:
             acc = pgm.warp_pipeline(K)
+        elif K_BATCH > 1:
+            # Split-K: compute the partial GEMM over this CTA's K-slice only;
+            # the partials are atomic-added into the (pre-zeroed) fp32 output
+            # below. The launcher enforces K % (BLOCK_K*K_BATCH) == 0 so every
+            # slice tile is full (EVEN_K) and the slices are numerically
+            # independent (each MXFP4 K-block carries its own scale).
+            K_slice = K // K_BATCH
+            k_tile_start = kb * (K_slice // BLOCK_K)
+            acc = pgm.pipeline(K_slice, k_tile_start)
         else:
             acc = pgm.pipeline(K)
 
@@ -3467,7 +3494,13 @@ def _pipelined_moe_tile_compute(
         offs_y_m_2d_safe = offs_y_m_safe[:, None]
         y_offs = offs_y_m_2d_safe * stride_ym + offs_y_n[None, :] * stride_yn
 
-    gl.store(y_ptr + y_offs, out, mask=mask_y)
+    if K_BATCH > 1:
+        # Split-K accumulation: sum this CTA's K-slice partial into the
+        # pre-zeroed output. Linear in K, so the order-independent atomic
+        # add reconstructs the full-K result (up to fp32 add reordering).
+        gl.atomic_add(y_ptr + y_offs, out, mask=mask_y, sem="relaxed")
+    else:
+        gl.store(y_ptr + y_offs, out, mask=mask_y)
 
 
 @gluon.jit
@@ -3583,6 +3616,7 @@ def _pipelined_moe_kernel_scaled(
     W_PREFETCH: gl.constexpr = True,
     W_VIA_VGPR_SIBLING: gl.constexpr = False,
     SCALE_VIA_VGPR_SIBLING: gl.constexpr = False,
+    K_BATCH: gl.constexpr = 1,
 ):
     if GRID_N > 0:
         grid_n: gl.constexpr = GRID_N
@@ -3594,16 +3628,26 @@ def _pipelined_moe_kernel_scaled(
     if USE_BLOCK_SCHEDULE:
         unpadded_m = gl.load(block_offs_ptr + N_EXPTS_TOT).to(gl.int32)
 
-    for tile_idx in range(gl.program_id(0), NUM_TILES, gl.num_programs(0)):
+    for tile_idx in range(gl.program_id(0), NUM_TILES * K_BATCH, gl.num_programs(0)):
+        # Split-K: the persistent index space is NUM_TILES * K_BATCH virtual
+        # tiles; the low factor selects the K-slice (kb), the high factor the
+        # output tile fed to the existing swizzle. K_BATCH==1 keeps the loop
+        # bound and decode byte-identical to the original.
+        if K_BATCH > 1:
+            kb = tile_idx % K_BATCH
+            base_tile = tile_idx // K_BATCH
+        else:
+            kb = 0
+            base_tile = tile_idx
         if USE_BLOCK_SCHEDULE:
-            swizzled = _xcd_chiplet_swizzle(tile_idx, NUM_TILES, XCD_SWIZZLE)
+            swizzled = _xcd_chiplet_swizzle(base_tile, NUM_TILES, XCD_SWIZZLE)
             grid_m_padded = NUM_TILES // grid_n
             pid_m, pid_n = _group_m_swizzle(swizzled, grid_m_padded, grid_n, GROUP_M)
             do_tile = pid_m < unpadded_m
         else:
             # Dense path: tile_idx packs (compact_idx, intra-expert pid);
             # GROUP_M applies WITHIN one expert (W only reusable per expert).
-            swizzled = _xcd_chiplet_swizzle(tile_idx, NUM_TILES, XCD_SWIZZLE)
+            swizzled = _xcd_chiplet_swizzle(base_tile, NUM_TILES, XCD_SWIZZLE)
             compact_idx = swizzled // tiles_per_expert
             local = swizzled % tiles_per_expert
             block_in_expert, pid_n = _group_m_swizzle(
@@ -3654,6 +3698,7 @@ def _pipelined_moe_kernel_scaled(
                 compact_idx,
                 block_in_expert,
                 pid_n,
+                kb,
                 BLOCK_M=BLOCK_M,
                 BLOCK_N=BLOCK_N,
                 BLOCK_K=BLOCK_K,
@@ -3687,6 +3732,7 @@ def _pipelined_moe_kernel_scaled(
                 W_PREFETCH=W_PREFETCH,
                 W_VIA_VGPR_SIBLING=W_VIA_VGPR_SIBLING,
                 SCALE_VIA_VGPR_SIBLING=SCALE_VIA_VGPR_SIBLING,
+                K_BATCH=K_BATCH,
             )
 
 
@@ -4010,13 +4056,39 @@ def _launch_kernel(
         block_schedule_buf = _make_dummy(x.device, torch.int32)
         n_slices = 0
 
+    # Split-K (k_batch) gate. Default 1 = OFF (byte-identical). When on, the
+    # persistent index space grows by k_batch and each output tile is
+    # accumulated from k_batch atomic-add partials; only the plain
+    # (non-SwiGLU) dense GEMM path is supported for this first cut.
+    k_batch = _K_BATCH
+    if k_batch > 1:
+        assert swiglu is None, (
+            "TS_KBATCH split-K supports only the plain (non-SwiGLU) GEMM path; "
+            "SwiGLU is non-linear so partial K-sums cannot be fused"
+        )
+        assert (
+            bias is None and gate_scal is None
+        ), "TS_KBATCH split-K: bias / gate_scal accumulation not implemented yet"
+        assert scatter_indx is None, "TS_KBATCH split-K: scatter not supported yet"
+        assert not has_ragged_offs, "TS_KBATCH split-K: dense (non-ragged) only"
+        assert not (use_slice_mn or use_slice_n or use_warp_pipeline), (
+            "TS_KBATCH split-K is wired only into the MoEPipelinedProgram path; "
+            "disable use_slice_mn / use_slice_n / use_warp_pipeline"
+        )
+        assert K % (block_k * k_batch) == 0, (
+            f"TS_KBATCH={k_batch} requires K ({K}) divisible by "
+            f"BLOCK_K*K_BATCH ({block_k}*{k_batch})"
+        )
+        # The output doubles as the atomic-add target; it must start zeroed.
+        y.zero_()
+    persistent_tiles = num_tiles_total * k_batch
     if persistent:
         if num_ctas is None:
-            num_ctas = _persistent_grid_size(num_tiles_total)
+            num_ctas = _persistent_grid_size(persistent_tiles)
         else:
-            num_ctas = max(1, min(num_ctas, num_tiles_total))
+            num_ctas = max(1, min(num_ctas, persistent_tiles))
     else:
-        num_ctas = max(1, num_tiles_total)
+        num_ctas = max(1, persistent_tiles)
     grid = (num_ctas, 1)
 
     grid_m_for_swizzle = num_tiles_total // grid_n
@@ -4230,6 +4302,7 @@ def _launch_kernel(
         W_VIA_VGPR_SIBLING=w_via_vgpr_sibling,
         SCALE_VIA_VGPR_SIBLING=scale_via_vgpr_sibling,
         W_PREFETCH=_W_PREFETCH,
+        K_BATCH=k_batch,
         GRID_N=grid_n,
         GROUP_M=group_m,
         XCD_SWIZZLE=xcd_swizzle,
