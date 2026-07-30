@@ -1281,7 +1281,7 @@ class KimiLinearMoE(nn.Module):
             activation_situ_beta=situ_beta,
             activation_situ_linear_beta=situ_linear_beta,
         )
-        self._input_projections_fused = False
+        self.input_projection_weight: torch.Tensor | None = None
         self.native_latent_moe = (
             LatentMoELayer(
                 router=self.gate,
@@ -1344,35 +1344,23 @@ class KimiLinearMoE(nn.Module):
             getattr(self.shared_experts, "_has_unquantized_shared_weights", False)
         ):
             return
-        parts = (
-            self.gate.weight,
-            self.routed_expert_down_proj.weight,
-            self.shared_experts.gate_up_proj.weight,
+        modules = (
+            self.gate,
+            self.routed_expert_down_proj,
+            self.shared_experts.gate_up_proj,
         )
-        hidden_size = parts[0].shape[1]
-        if any(
-            part.ndim != 2
-            or part.shape[1] != hidden_size
-            or part.dtype != parts[0].dtype
-            or part.device != parts[0].device
-            for part in parts
-        ):
-            return
-        fused = parts[0].new_empty((sum(part.shape[0] for part in parts), hidden_size))
-        views = []
-        offset = 0
-        for part in parts:
-            view = fused.narrow(0, offset, part.shape[0])
-            view.copy_(part)
-            views.append(view)
-            offset += part.shape[0]
         # Held so the row views stay alive; deliberately not a registered
         # buffer, which would duplicate every projection in the state dict.
-        self.input_projection_weight = fused
-        self.gate.weight.data = views[0]
-        self.routed_expert_down_proj.weight.data = views[1]
-        self.shared_experts.gate_up_proj.weight.data = views[2]
-        self._input_projections_fused = True
+        # Any layout a fused GEMM cannot read is caught downstream by
+        # ``fused_weight_view``, which leaves the composition in place.
+        self.input_projection_weight = torch.cat(
+            [module.weight for module in modules], dim=0
+        )
+        offset = 0
+        for module in modules:
+            rows = module.weight.shape[0]
+            module.weight.data = self.input_projection_weight.narrow(0, offset, rows)
+            offset += rows
 
     def _fused_input_projections(
         self, hidden_states: torch.Tensor
@@ -1382,7 +1370,7 @@ class KimiLinearMoE(nn.Module):
         Returns ``None`` before the projection weights are concatenated, which
         leaves the caller on the separate per-module projections.
         """
-        if not self._input_projections_fused:
+        if self.input_projection_weight is None:
             return None
         router_logits, routed_input, shared_input = moe_input_projections(
             hidden_states,

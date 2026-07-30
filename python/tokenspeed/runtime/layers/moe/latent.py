@@ -361,13 +361,18 @@ class LatentMoELayer(nn.Module):
         # Fusing the three input projections into one GEMM serializes the
         # shared branch against the routed one by construction, so it is only
         # worth taking when the branches were not going to overlap anyway.
-        projections = (
-            self.input_projections(hidden_states)
-            if self.input_projections is not None
-            and not overlap_shared
-            and num_tokens > 0
-            else None
+        fused = None
+        if self.input_projections is not None and not overlap_shared and num_tokens > 0:
+            fused = self.input_projections(hidden_states)
+        fused_router, fused_routed, fused_shared = (
+            (None, None, None) if fused is None else fused
         )
+
+        def project(projection: torch.Tensor | None, module: nn.Module) -> torch.Tensor:
+            """Take the fused projection when one was computed for this input."""
+            if projection is not None:
+                return projection
+            return _module_tensor_output(module, hidden_states)
 
         def run_shared_branch() -> None:
             nonlocal shared_output, shared_reduction_applied
@@ -380,11 +385,7 @@ class LatentMoELayer(nn.Module):
             # both paths run serially on the primary stream.  The fork joins
             # before collectives, and this H-width result is added to the
             # routed result at the end of the layer.
-            shared_output = (
-                projections[2]
-                if projections is not None
-                else _module_tensor_output(self.shared_experts, hidden_states)
-            )
+            shared_output = project(fused_shared, self.shared_experts)
             _check_shape(shared_output, output_shape, "shared_experts")
             # In graph mode the branch is serial. Reduce here to retain the
             # established shared-before-routed Iris collective order. Eager
@@ -406,11 +407,7 @@ class LatentMoELayer(nn.Module):
             with fork.branch():
                 run_shared_branch()
 
-            router_logits = (
-                projections[0]
-                if projections is not None
-                else _module_tensor_output(self.router, hidden_states)
-            )
+            router_logits = project(fused_router, self.router)
             if router_logits.ndim != 2 or router_logits.shape[0] != num_tokens:
                 raise ValueError("router must return logits shaped [T, E]")
             if num_tokens > 0:
@@ -422,11 +419,7 @@ class LatentMoELayer(nn.Module):
                     router_logits=router_logits,
                 )
 
-            routed_input = (
-                projections[1]
-                if projections is not None
-                else _module_tensor_output(self.routed_down_proj, hidden_states)
-            )
+            routed_input = project(fused_routed, self.routed_down_proj)
             if routed_input.ndim != 2 or routed_input.shape[0] != num_tokens:
                 raise ValueError("routed_down_proj must return [T, L]")
             latent_shape = tuple(routed_input.shape)
