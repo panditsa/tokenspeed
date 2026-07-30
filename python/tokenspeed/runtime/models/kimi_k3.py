@@ -1329,6 +1329,48 @@ class KimiLinearMoE(nn.Module):
             )
         )
 
+    def fuse_input_projection_weights(self) -> None:
+        """Back the router, routed-down, and shared gate/up weights with one tensor.
+
+        The three projections consume the same activation and reduce over the
+        same width, so one ``[experts + latent + 2 * shared, hidden]`` weight
+        lets a single GEMM replace three. Each module keeps a contiguous row
+        view of that tensor, so the rebinding adds no steady-state memory and
+        leaves every unfused composition working unchanged.
+        """
+        if not bool(
+            getattr(self.shared_experts, "_has_unquantized_shared_weights", False)
+        ):
+            return
+        parts = (
+            self.gate.weight,
+            self.routed_expert_down_proj.weight,
+            self.shared_experts.gate_up_proj.weight,
+        )
+        hidden_size = parts[0].shape[1]
+        if any(
+            part.ndim != 2
+            or part.shape[1] != hidden_size
+            or part.dtype != parts[0].dtype
+            or part.device != parts[0].device
+            for part in parts
+        ):
+            return
+        fused = parts[0].new_empty((sum(part.shape[0] for part in parts), hidden_size))
+        views = []
+        offset = 0
+        for part in parts:
+            view = fused.narrow(0, offset, part.shape[0])
+            view.copy_(part)
+            views.append(view)
+            offset += part.shape[0]
+        # Held so the row views stay alive; deliberately not a registered
+        # buffer, which would duplicate every projection in the state dict.
+        self.input_projection_weight = fused
+        self.gate.weight.data = views[0]
+        self.routed_expert_down_proj.weight.data = views[1]
+        self.shared_experts.gate_up_proj.weight.data = views[2]
+
     def _routed_experts(
         self,
         routed_in: torch.Tensor,
@@ -2247,6 +2289,10 @@ class KimiLinearForCausalLM(BaseCausalLM):
                 layer.mlp_res_norm.weight.float()
                 * layer.mlp_res_proj.weight.reshape(-1).float()
             ).to(torch.bfloat16)
+
+        for layer in self.model.layers:
+            if getattr(layer, "is_moe_layer", False):
+                layer.block_sparse_moe.fuse_input_projection_weights()
 
 
 # ===----------------------------------------------------------------------=== #
