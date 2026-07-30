@@ -48,6 +48,12 @@ TensorReducer = Callable[[torch.Tensor], torch.Tensor]
 TensorPairReducer = Callable[
     [torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor]
 ]
+# Projects hidden states to router logits, routed latent, and the unreduced
+# shared-expert partial in one pass, or returns None to use the modules.
+InputProjector = Callable[
+    [torch.Tensor],
+    tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None,
+]
 _SUPPORTED_EP_SIZES = {1, 2, 4, 8}
 
 
@@ -259,8 +265,11 @@ class LatentMoELayer(nn.Module):
         expert_parallel_group: tuple[int, ...] | None = None,
         return_separate_outputs: bool = False,
         defer_routed_up_projection: bool = False,
+        input_projections: InputProjector | None = None,
     ) -> None:
         super().__init__()
+        if input_projections is not None and shared_experts is None:
+            raise ValueError("input_projections requires shared_experts")
         if shared_reduce is not None and shared_experts is None:
             raise ValueError("shared_reduce requires shared_experts")
         if joint_reduce is not None and shared_experts is None:
@@ -316,6 +325,7 @@ class LatentMoELayer(nn.Module):
         self.stream_fork = StreamFork(shared_expert_stream)
         self.return_separate_outputs = return_separate_outputs
         self.defer_routed_up_projection = defer_routed_up_projection
+        self.input_projections = input_projections
 
     def forward(
         self,
@@ -348,6 +358,17 @@ class LatentMoELayer(nn.Module):
         )
         shared_reduction_applied = False
 
+        # Fusing the three input projections into one GEMM serializes the
+        # shared branch against the routed one by construction, so it is only
+        # worth taking when the branches were not going to overlap anyway.
+        projections = (
+            self.input_projections(hidden_states)
+            if self.input_projections is not None
+            and not overlap_shared
+            and num_tokens > 0
+            else None
+        )
+
         def run_shared_branch() -> None:
             nonlocal shared_output, shared_reduction_applied
             if self.shared_experts is None:
@@ -359,7 +380,11 @@ class LatentMoELayer(nn.Module):
             # both paths run serially on the primary stream.  The fork joins
             # before collectives, and this H-width result is added to the
             # routed result at the end of the layer.
-            shared_output = _module_tensor_output(self.shared_experts, hidden_states)
+            shared_output = (
+                projections[2]
+                if projections is not None
+                else _module_tensor_output(self.shared_experts, hidden_states)
+            )
             _check_shape(shared_output, output_shape, "shared_experts")
             # In graph mode the branch is serial. Reduce here to retain the
             # established shared-before-routed Iris collective order. Eager
@@ -381,7 +406,11 @@ class LatentMoELayer(nn.Module):
             with fork.branch():
                 run_shared_branch()
 
-            router_logits = _module_tensor_output(self.router, hidden_states)
+            router_logits = (
+                projections[0]
+                if projections is not None
+                else _module_tensor_output(self.router, hidden_states)
+            )
             if router_logits.ndim != 2 or router_logits.shape[0] != num_tokens:
                 raise ValueError("router must return logits shaped [T, E]")
             if num_tokens > 0:
@@ -393,7 +422,11 @@ class LatentMoELayer(nn.Module):
                     router_logits=router_logits,
                 )
 
-            routed_input = _module_tensor_output(self.routed_down_proj, hidden_states)
+            routed_input = (
+                projections[1]
+                if projections is not None
+                else _module_tensor_output(self.routed_down_proj, hidden_states)
+            )
             if routed_input.ndim != 2 or routed_input.shape[0] != num_tokens:
                 raise ValueError("routed_down_proj must return [T, L]")
             latent_shape = tuple(routed_input.shape)

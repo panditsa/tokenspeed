@@ -1281,6 +1281,7 @@ class KimiLinearMoE(nn.Module):
             activation_situ_beta=situ_beta,
             activation_situ_linear_beta=situ_linear_beta,
         )
+        self._input_projections_fused = False
         self.native_latent_moe = (
             LatentMoELayer(
                 router=self.gate,
@@ -1306,6 +1307,7 @@ class KimiLinearMoE(nn.Module):
                 expert_parallel_group=mapping.moe.ep_group,
                 return_separate_outputs=True,
                 defer_routed_up_projection=True,
+                input_projections=self._fused_input_projections,
             )
             if self.execution_plan.use_native
             else None
@@ -1370,6 +1372,33 @@ class KimiLinearMoE(nn.Module):
         self.gate.weight.data = views[0]
         self.routed_expert_down_proj.weight.data = views[1]
         self.shared_experts.gate_up_proj.weight.data = views[2]
+        self._input_projections_fused = True
+
+    def _fused_input_projections(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        """Project the router, routed latent, and shared partial in one pass.
+
+        Returns ``None`` before the projection weights are concatenated, which
+        leaves the caller on the separate per-module projections.
+        """
+        if not self._input_projections_fused:
+            return None
+        router_logits, routed_input, shared_input = moe_input_projections(
+            hidden_states,
+            self.gate.weight,
+            self.routed_expert_down_proj.weight,
+            self.shared_experts.gate_up_proj.weight,
+            gate_clamp=self.shared_experts.act_fn.beta,
+            up_clamp=self.shared_experts.act_fn.linear_beta,
+        )
+        # The shared experts hold reduce_results=False, so this partial is
+        # reduced by the layer's shared or joint reducer, not here.
+        shared_output = kimi3_shared_down_projection(
+            shared_input,
+            self.shared_experts.down_proj.weight,
+        )
+        return router_logits, routed_input, shared_output
 
     def _routed_experts(
         self,
