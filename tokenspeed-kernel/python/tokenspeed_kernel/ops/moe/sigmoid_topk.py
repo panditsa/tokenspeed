@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import torch
+
 from tokenspeed_kernel.ops.moe.triton.kimi3_sigmoid_topk import (
     kimi3_sigmoid_bias_topk,
 )
@@ -80,8 +81,7 @@ def moe_sigmoid_bias_topk(
         or not logical_to_physical_map.is_contiguous()
     ):
         raise ValueError(
-            "logical_to_physical_map must be contiguous colocated INT32/INT64 "
-            "[experts]"
+            "logical_to_physical_map must be contiguous colocated INT32/INT64 [experts]"
         )
     if not 0 < topk <= experts:
         raise ValueError(f"topk must be in [1, {experts}], got {topk}")
@@ -92,14 +92,30 @@ def moe_sigmoid_bias_topk(
             torch.empty(shape, device=router_logits.device, dtype=torch.int32),
         )
     platform = Platform.get()
-    if (
+    kimi3_route = (
         solution is None
-        and (platform.is_cdna4 or platform.is_nvidia)
-        and router_logits.shape == (1, 896)
+        and experts == 896
         and router_logits.dtype == torch.float32
         and correction_bias.dtype == torch.float32
         and topk == 16
-    ):
+    )
+    if kimi3_route and platform.is_cdna4:
+        from tokenspeed_kernel.ops.moe.gluon.sigmoid_topk import (
+            gluon_sigmoid_bias_topk_gfx950,
+        )
+
+        topk_weights, topk_ids = gluon_sigmoid_bias_topk_gfx950(
+            router_logits=router_logits,
+            correction_bias=correction_bias,
+            topk=topk,
+            routed_scaling_factor=routed_scaling_factor,
+            normalize_topk_weights=normalize_topk_weights,
+            logical_to_physical_map=logical_to_physical_map,
+        )
+        if topk_weights.dtype != weights_dtype:
+            topk_weights = topk_weights.to(weights_dtype)
+        return topk_weights, topk_ids
+    if kimi3_route and platform.is_nvidia and tokens == 1:
         # The packed-key single-CTA kernel wins on both vendors for the K3
         # decode shape: one bitonic top-16 instead of the grouped multi-pass
         # (NVIDIA B300: 3.7us vs 7.0us for the minimax path, bit-identical

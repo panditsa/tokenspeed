@@ -20,7 +20,10 @@
 
 from __future__ import annotations
 
+import os
+
 import torch
+
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
@@ -34,6 +37,7 @@ platform = current_platform()
 # TP8/EP8 model measurements favor warp GEMV through M=4 and grouped MFMA
 # above it, despite a later crossover in isolated kernel measurements.
 _ROUTE_DIRECT_DECODE_MAX_TOKENS = 4
+_KIMI3_A4W4_DECODE = os.environ.get("TOKENSPEED_KIMI3_GLUON_A4W4") == "1"
 
 
 if platform.is_amd:
@@ -41,6 +45,9 @@ if platform.is_amd:
         gluon_mxfp_dynamic_mxfp4_fused_moe,
         gluon_mxfp_fused_moe,
         gluon_mxfp_precomputed_mxfp4_fused_moe,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.moe import (
+        gluon_mxfp4_situ_moe_decode,
     )
     from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.situ_grouped import (
         gluon_a16w4_situ_grouped_ep_gfx950,
@@ -74,6 +81,39 @@ if platform.is_amd:
         expected = int(getattr(w, "num_local_experts", tensors[0].shape[0]))
         if tensors[0].shape[0] != expected:
             raise ValueError("linear MXFP4 weights have the wrong local expert count")
+        if _KIMI3_A4W4_DECODE:
+            _attach_kimi3_a4w4_weights(w)
+
+    def _attach_kimi3_a4w4_weights(w: torch.nn.Module) -> None:
+        """Keep an MFMA-native copy for the experimental A4W4 decode path."""
+        if hasattr(w, "_kimi3_a4w4_w13_weight"):
+            return
+
+        from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused import (
+            shuffle_weight_for_gluon_dot_layout,
+        )
+        from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.scale_layout import (
+            swizzle_cdna4_mxfp4_scale,
+        )
+
+        def interleave_gate_up(tensor: torch.Tensor) -> torch.Tensor:
+            gate, up = tensor.chunk(2, dim=1)
+            return torch.stack((gate, up), dim=2).flatten(1, 2).contiguous()
+
+        def preshuffle(weight: torch.Tensor) -> torch.Tensor:
+            k_packed = weight.transpose(-2, -1).contiguous()
+            return shuffle_weight_for_gluon_dot_layout(k_packed)
+
+        w13 = w.w13_weight
+        w13_scale = w.w13_weight_scale
+        if getattr(w, "w13_input_layout", "concatenated") == "concatenated":
+            w13 = interleave_gate_up(w13)
+            w13_scale = interleave_gate_up(w13_scale)
+
+        w._kimi3_a4w4_w13_weight = preshuffle(w13)
+        w._kimi3_a4w4_w13_scale = swizzle_cdna4_mxfp4_scale(w13_scale)
+        w._kimi3_a4w4_w2_weight = preshuffle(w.w2_weight)
+        w._kimi3_a4w4_w2_scale = swizzle_cdna4_mxfp4_scale(w.w2_weight_scale)
 
     def _swiglu_args(w: torch.nn.Module) -> tuple[float, float, float]:
         swiglu_arg = getattr(w, "swiglu_arg", None)
@@ -177,6 +217,28 @@ if platform.is_amd:
                 w13_interleaved=(
                     getattr(w, "w13_input_layout", "concatenated") == "interleaved"
                 ),
+            )
+        situ_linear_beta = getattr(w, "activation_situ_linear_beta", None)
+        use_a4w4_decode = (
+            _KIMI3_A4W4_DECODE
+            and 4 < x.shape[0] < 16
+            and situ_linear_beta is not None
+            and x.is_contiguous()
+            and int(w.w13_weight.shape[2]) * 2 == x.shape[1]
+            and intermediate % 32 == 0
+        )
+        if use_a4w4_decode:
+            return gluon_mxfp4_situ_moe_decode(
+                x,
+                w._kimi3_a4w4_w13_weight,
+                w._kimi3_a4w4_w13_scale,
+                w._kimi3_a4w4_w2_weight,
+                w._kimi3_a4w4_w2_scale,
+                topk_ids,
+                topk_weights,
+                situ_beta=float(getattr(w, "activation_situ_beta", 1.0)),
+                situ_linear_beta=float(situ_linear_beta),
+                expert_start=expert_start,
             )
         return gluon_a16w4_situ_grouped_ep_gfx950(
             x,

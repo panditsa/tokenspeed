@@ -24,6 +24,7 @@
 from __future__ import annotations
 
 import torch
+
 from tokenspeed_kernel_amd._triton import gl, gluon
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.decode_kernels import (
     gluon_topk_route_supported,
@@ -38,6 +39,7 @@ _PREFILL_ROUTE_GL_DTYPE = {
     torch.bfloat16: gl.bfloat16,
     torch.float32: gl.float32,
 }
+_LOG2E = gl.constexpr(1.4426950408889634)
 
 
 def _next_pow2(x: int) -> int:
@@ -50,6 +52,7 @@ def _sigmoid_bias_topk_route_prefill_kernel(
     bias_ptr,
     topk_ids_ptr,
     topk_weights_ptr,
+    logical_to_physical_ptr,
     stride_lm,
     stride_le,
     stride_be,
@@ -63,6 +66,7 @@ def _sigmoid_bias_topk_route_prefill_kernel(
     TKP: gl.constexpr,
     NORMALIZE_TOPK_WEIGHTS: gl.constexpr,
     ROUTED_SCALING_FACTOR: gl.constexpr,
+    HAS_DISPATCH_MAP: gl.constexpr,
     X_DTYPE: gl.constexpr,
     NUM_WARPS: gl.constexpr,
 ):
@@ -78,7 +82,9 @@ def _sigmoid_bias_topk_route_prefill_kernel(
         mask=expert_mask,
         other=-float("inf"),
     ).to(gl.float32)
-    scores = gl.fdiv(1.0, 1.0 + gl.exp(-logits)).to(X_DTYPE)
+    scores = gl.extra.libdevice.fast_dividef(1.0, 1.0 + gl.exp2(-logits * _LOG2E)).to(
+        X_DTYPE
+    )
     bias = cdna4.buffer_load(
         bias_ptr,
         (expert * stride_be).to(gl.int32),
@@ -105,11 +111,16 @@ def _sigmoid_bias_topk_route_prefill_kernel(
         selected_weights = selected_weights.to(X_DTYPE)
         denominator = gl.sum(selected_weights, axis=0)
         denominator = gl.where(denominator != 0.0, denominator, 1.0)
-        selected_weights = selected_weights.to(gl.float32) * (
-            ROUTED_SCALING_FACTOR / denominator
-        )
+        selected_weights = selected_weights.to(gl.float32) / denominator
+    selected_weights = selected_weights * ROUTED_SCALING_FACTOR
 
     topk_mask = topk_lane < TOPK
+    if HAS_DISPATCH_MAP:
+        selected_ids = gl.load(
+            logical_to_physical_ptr + selected_ids,
+            mask=topk_mask,
+            other=-1,
+        )
     cdna4.buffer_store(
         selected_ids,
         topk_ids_ptr,
@@ -131,6 +142,7 @@ def invoke_sigmoid_bias_topk_route_prefill_gluon(
     *,
     routed_scaling_factor: float = 1.0,
     normalize_topk_weights: bool = True,
+    logical_to_physical_map: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Large-M Kimi noaux_tc routing with one independent CTA per token."""
     if (
@@ -148,6 +160,13 @@ def invoke_sigmoid_bias_topk_route_prefill_gluon(
         router_logits = router_logits.contiguous()
     if not correction_bias.is_contiguous():
         correction_bias = correction_bias.contiguous()
+    if logical_to_physical_map is not None and (
+        logical_to_physical_map.shape != (router_logits.shape[1],)
+        or logical_to_physical_map.dtype != torch.int32
+        or logical_to_physical_map.device != router_logits.device
+        or not logical_to_physical_map.is_contiguous()
+    ):
+        raise ValueError("dispatch map must be contiguous colocated INT32 [E]")
     tokens, experts = router_logits.shape
     topk_ids = torch.empty(
         (tokens, topk), dtype=torch.int32, device=router_logits.device
@@ -161,6 +180,7 @@ def invoke_sigmoid_bias_topk_route_prefill_gluon(
         correction_bias,
         topk_ids,
         topk_weights,
+        topk_ids if logical_to_physical_map is None else logical_to_physical_map,
         router_logits.stride(0),
         router_logits.stride(1),
         correction_bias.stride(0),
@@ -174,6 +194,7 @@ def invoke_sigmoid_bias_topk_route_prefill_gluon(
         TKP=_next_pow2(topk),
         NORMALIZE_TOPK_WEIGHTS=normalize_topk_weights,
         ROUTED_SCALING_FACTOR=float(routed_scaling_factor),
+        HAS_DISPATCH_MAP=logical_to_physical_map is not None,
         X_DTYPE=_PREFILL_ROUTE_GL_DTYPE[router_logits.dtype],
         NUM_WARPS=num_warps,
         num_warps=num_warps,
