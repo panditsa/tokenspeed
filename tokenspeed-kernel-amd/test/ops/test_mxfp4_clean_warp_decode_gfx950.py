@@ -20,6 +20,7 @@ if not _is_gfx950():
     )
 
 
+from tokenspeed_kernel.ops.moe.gluon import mxfp4 as registry_mxfp4
 from tokenspeed_kernel_amd.ops.moe import fused_mxfp_gfx950  # noqa: E402
 from tokenspeed_kernel_amd.ops.moe.fused_mxfp_gfx950 import (  # noqa: E402
     gluon_mxfp_dynamic_mxfp4_fused_moe,
@@ -27,8 +28,12 @@ from tokenspeed_kernel_amd.ops.moe.fused_mxfp_gfx950 import (  # noqa: E402
 )
 from tokenspeed_kernel_amd.ops.moe.gluon_a4w4_gfx950 import (  # noqa: E402
     gluon_mxfp4_moe_decode,
+    gluon_mxfp4_situ_moe_decode,
     invoke_sigmoid_bias_topk_route_gluon,
     invoke_softmax_topk_route_gluon,
+)
+from tokenspeed_kernel_amd.ops.moe.gluon_a4w4_gfx950.quantize import (
+    quantize_mxfp4_activation_gluon,
 )
 from tokenspeed_kernel_amd.ops.moe.mxfp4_gfx950_preprocess import (  # noqa: E402
     preprocess_gluon_mxfp4_gfx950_moe_weights,
@@ -903,6 +908,93 @@ def test_dynamic_mxfp4_direct_precomputed_matches_mfma_exact(
         topk=topk,
     )
     torch.testing.assert_close(out.float(), expected.float(), rtol=0.0, atol=0.0)
+
+
+def test_gluon_activation_quantizer_matches_reference_exact():
+    generator = torch.Generator(device="cuda").manual_seed(20260802)
+    hidden = torch.randn(
+        32, 1024, device="cuda", dtype=torch.bfloat16, generator=generator
+    )
+    actual, actual_scale = quantize_mxfp4_activation_gluon(hidden)
+    expected, expected_scale = fused_mxfp_gfx950._quantize_mxfp4_activation(hidden)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(actual_scale, expected_scale, rtol=0, atol=0)
+
+
+def test_gluon_activation_quantizer_accepts_zero_tokens():
+    hidden = torch.empty((0, 1024), device="cuda", dtype=torch.bfloat16)
+    actual, actual_scale = quantize_mxfp4_activation_gluon(hidden)
+    assert actual.shape == (0, 512)
+    assert actual_scale.shape == (1024, 0)
+
+
+def test_situ_a4w4_linear_weights_match_preshuffled_exact():
+    hidden_size = 1024
+    intermediate_size = 512
+    num_experts = 8
+    tokens = 4
+    topk = 2
+    device = "cuda"
+    generator = torch.Generator(device=device).manual_seed(20260803)
+    hidden = torch.randn(
+        tokens,
+        hidden_size,
+        device=device,
+        dtype=torch.bfloat16,
+        generator=generator,
+    )
+    linear = _make_weights(
+        num_experts=num_experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        device=device,
+    )
+    layer = _make_preprocessed_layer(
+        *linear,
+        num_experts=num_experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        device=device,
+    )
+    ids = torch.arange(tokens * topk, device=device, dtype=torch.int32).reshape(
+        tokens, topk
+    )
+    weights = torch.full((tokens, topk), 0.5, device=device)
+
+    expected = gluon_mxfp4_situ_moe_decode(
+        hidden,
+        layer.w13_weight_triton_tensor,
+        layer.w13_precision_config.b_mx_scale,
+        layer.w2_weight_triton_tensor,
+        layer.w2_precision_config.b_mx_scale,
+        ids,
+        weights,
+    )
+    actual = gluon_mxfp4_situ_moe_decode(
+        hidden,
+        *linear,
+        ids,
+        weights,
+        linear_weights=True,
+    )
+    experimental = torch.nn.Module()
+    experimental.w13_weight, experimental.w13_weight_scale = linear[:2]
+    experimental.w2_weight, experimental.w2_weight_scale = linear[2:]
+    experimental.w13_input_layout = "concatenated"
+    registry_mxfp4._attach_kimi3_a4w4_weights(experimental)
+    attached = gluon_mxfp4_situ_moe_decode(
+        hidden,
+        experimental._kimi3_a4w4_w13_weight,
+        experimental._kimi3_a4w4_w13_scale,
+        experimental._kimi3_a4w4_w2_weight,
+        experimental._kimi3_a4w4_w2_scale,
+        ids,
+        weights,
+    )
+    torch.cuda.synchronize()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(attached, expected, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("num_tokens", [1, 2])

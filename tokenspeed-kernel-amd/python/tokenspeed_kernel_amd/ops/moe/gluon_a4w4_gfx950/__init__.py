@@ -33,7 +33,10 @@ from tokenspeed_kernel_amd.ops.moe.gluon_a4w4_gfx950.decode_stage1 import (
 from tokenspeed_kernel_amd.ops.moe.gluon_a4w4_gfx950.decode_stage2 import (
     invoke_stage2_mxfp4_mfma_decode_gluon,
 )
-from tokenspeed_kernel_amd.ops.moe.gluon_a4w4_gfx950.moe import gluon_mxfp4_moe_decode
+from tokenspeed_kernel_amd.ops.moe.gluon_a4w4_gfx950.moe import (
+    gluon_mxfp4_moe_decode,
+    gluon_mxfp4_situ_moe_decode,
+)
 from tokenspeed_kernel_amd.ops.moe.gluon_a4w4_gfx950.prefill_stage1 import (
     invoke_gluon_mxfp4_moe_stage1,
 )
@@ -55,6 +58,7 @@ __all__ = [
     "attach_prefill_aliases",
     "gather_package_cdna4_scale",
     "gluon_mxfp4_moe_decode",
+    "gluon_mxfp4_situ_moe_decode",
     "invoke_gluon_mxfp4_moe_stage1",
     "invoke_gluon_mxfp4_moe_stage2_1x2",
     "invoke_sigmoid_bias_topk_route_gluon",

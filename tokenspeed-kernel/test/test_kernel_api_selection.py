@@ -1354,6 +1354,89 @@ def test_kimi3_mxfp4_situ_ep8_auto_falls_back_to_triton_on_cdna3(
     )
 
 
+def _make_kimi3_experimental_a4w4_layer() -> torch.nn.Module:
+    w = torch.nn.Module()
+    w.w13_weight = torch.empty((2, 64, 32), dtype=torch.uint8)
+    w.w13_weight_scale = torch.empty((2, 64, 2), dtype=torch.uint8)
+    w.w2_weight = torch.empty((2, 64, 16), dtype=torch.uint8)
+    w.w2_weight_scale = torch.empty((2, 64, 1), dtype=torch.uint8)
+    w._kimi3_a4w4_w13_weight = object()
+    w._kimi3_a4w4_w13_scale = object()
+    w._kimi3_a4w4_w2_weight = object()
+    w._kimi3_a4w4_w2_scale = object()
+    w.activation_situ_beta = 4.0
+    w.activation_situ_linear_beta = 25.0
+    w.num_local_experts = 2
+    w.ep_rank = 0
+    w.w13_input_layout = "concatenated"
+    return w
+
+
+def test_kimi3_experimental_a4w4_dispatch_uses_preshuffled_weights(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not hasattr(_moe_gluon_mxfp4, "gluon_mxfp4_a16w4_situ_ep_precomputed_moe_apply"):
+        pytest.skip("gfx950 Gluon SiTU apply is AMD-only")
+
+    w = _make_kimi3_experimental_a4w4_layer()
+    captured: tuple[object, ...] | None = None
+
+    def fake_a4w4(*args, **kwargs):
+        nonlocal captured
+        captured = args
+        return "a4w4"
+
+    monkeypatch.setattr(_moe_gluon_mxfp4, "_KIMI3_A4W4_DECODE", True)
+    monkeypatch.setattr(_moe_gluon_mxfp4, "gluon_mxfp4_situ_moe_decode", fake_a4w4)
+    out = _moe_gluon_mxfp4.gluon_mxfp4_a16w4_situ_ep_precomputed_moe_apply(
+        {},
+        torch.empty((8, 64), dtype=torch.bfloat16),
+        w,
+        torch.empty((8, 2)),
+        topk_weights=torch.ones((8, 1)),
+        topk_ids=torch.zeros((8, 1), dtype=torch.int32),
+    )
+
+    assert out == "a4w4"
+    assert captured is not None
+    assert captured[1:5] == (
+        w._kimi3_a4w4_w13_weight,
+        w._kimi3_a4w4_w13_scale,
+        w._kimi3_a4w4_w2_weight,
+        w._kimi3_a4w4_w2_scale,
+    )
+
+
+def test_kimi3_experimental_a4w4_dispatch_excludes_m16(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not hasattr(_moe_gluon_mxfp4, "gluon_mxfp4_a16w4_situ_ep_precomputed_moe_apply"):
+        pytest.skip("gfx950 Gluon SiTU apply is AMD-only")
+
+    w = _make_kimi3_experimental_a4w4_layer()
+    monkeypatch.setattr(_moe_gluon_mxfp4, "_KIMI3_A4W4_DECODE", True)
+    monkeypatch.setattr(
+        _moe_gluon_mxfp4,
+        "gluon_mxfp4_situ_moe_decode",
+        lambda *args, **kwargs: pytest.fail("M=16 must not use A4W4"),
+    )
+    monkeypatch.setattr(
+        _moe_gluon_mxfp4,
+        "gluon_a16w4_situ_grouped_ep_gfx950",
+        lambda *args, **kwargs: "a16w4",
+    )
+    out = _moe_gluon_mxfp4.gluon_mxfp4_a16w4_situ_ep_precomputed_moe_apply(
+        {},
+        torch.empty((16, 64), dtype=torch.bfloat16),
+        w,
+        torch.empty((16, 2)),
+        topk_weights=torch.ones((16, 1)),
+        topk_ids=torch.zeros((16, 1), dtype=torch.int32),
+    )
+
+    assert out == "a16w4"
+
+
 def _make_fake_gluon_mxfp4_layer(top_k: int) -> torch.nn.Module:
     """Minimal ``w`` exposing only the attributes the apply wrapper reads.
 

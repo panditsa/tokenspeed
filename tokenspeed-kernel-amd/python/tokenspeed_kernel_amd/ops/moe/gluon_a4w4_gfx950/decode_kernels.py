@@ -36,6 +36,10 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel_amd._triton import gl, gluon, triton
+from tokenspeed_kernel_amd.ops.moe.gluon_a4w4_gfx950.quantize import (
+    quantize_mxfp4_tile,
+    store_cdna4_scale,
+)
 
 _LANES = gl.constexpr(64)  # wavefront width (reduction lanes)
 _ROUTE_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
@@ -48,6 +52,7 @@ _ROUTE_GL_DTYPE = {
     torch.bfloat16: gl.bfloat16,
     torch.float32: gl.float32,
 }
+_LOG2E = gl.constexpr(1.4426950408889634)
 
 
 def _next_pow2(x: int) -> int:
@@ -221,6 +226,7 @@ def _sigmoid_bias_topk_route_gluon_kernel(
     bias_ptr,  # (E)
     topk_ids_ptr,  # (M, TOPK) int32
     topk_weights_ptr,  # (M, TOPK) float32
+    logical_to_physical_ptr,  # (E), read only when HAS_DISPATCH_MAP
     stride_lm,
     stride_le,
     stride_be,
@@ -236,6 +242,7 @@ def _sigmoid_bias_topk_route_gluon_kernel(
     TKP: gl.constexpr,
     NORMALIZE_TOPK_WEIGHTS: gl.constexpr,
     ROUTED_SCALING_FACTOR: gl.constexpr,
+    HAS_DISPATCH_MAP: gl.constexpr,
     X_DTYPE: gl.constexpr,
     NUM_WARPS: gl.constexpr,
 ):
@@ -252,7 +259,9 @@ def _sigmoid_bias_topk_route_gluon_kernel(
     ).to(gl.float32)
     # Match the reference grouped-biased route: sigmoid scores are rounded to the
     # router dtype before the bias add, top-k choice, and optional normalization.
-    scores = gl.fdiv(1.0, 1.0 + gl.exp(-logits)).to(X_DTYPE)
+    scores = gl.extra.libdevice.fast_dividef(1.0, 1.0 + gl.exp2(-logits * _LOG2E)).to(
+        X_DTYPE
+    )
     bias = gl.load(
         bias_ptr + col.to(gl.int64) * stride_be,
         mask=col < E,
@@ -278,7 +287,8 @@ def _sigmoid_bias_topk_route_gluon_kernel(
         val_t = val_t.to(X_DTYPE)
         denom = gl.sum(val_t, axis=1, keep_dims=True)
         denom = gl.where(denom != 0.0, denom, 1.0)
-        val_t = gl.fdiv(val_t, denom) * ROUTED_SCALING_FACTOR
+        val_t = gl.fdiv(val_t, denom)
+    val_t = val_t * ROUTED_SCALING_FACTOR
 
     m = gl.arange(0, MP, layout=gl.SliceLayout(1, lt))
     zero_i = gl.zeros([MP, TKP], gl.int32, layout=lt)
@@ -288,6 +298,8 @@ def _sigmoid_bias_topk_route_gluon_kernel(
         idx_r = gl.sum(gl.where(sel, idx_t, zero_i), axis=1)
         val_r = gl.sum(gl.where(sel, val_t, zero_f), axis=1)
         valid_m = m < M
+        if HAS_DISPATCH_MAP:
+            idx_r = gl.load(logical_to_physical_ptr + idx_r, mask=valid_m, other=-1)
         gl.store(
             topk_ids_ptr + m.to(gl.int64) * stride_tim + r * stride_tik,
             idx_r,
@@ -372,6 +384,7 @@ def invoke_sigmoid_bias_topk_route_gluon(
     *,
     routed_scaling_factor: float = 1.0,
     normalize_topk_weights: bool = True,
+    logical_to_physical_map: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Route with DeepSeekV3/Kimi noaux_tc semantics for a single group.
 
@@ -385,6 +398,13 @@ def invoke_sigmoid_bias_topk_route_gluon(
         raise ValueError("correction_bias must be a rank-1 tensor with E elements")
     router_logits = router_logits.contiguous()
     correction_bias = correction_bias.contiguous()
+    if logical_to_physical_map is not None and (
+        logical_to_physical_map.shape != (router_logits.shape[1],)
+        or logical_to_physical_map.dtype != torch.int32
+        or logical_to_physical_map.device != router_logits.device
+        or not logical_to_physical_map.is_contiguous()
+    ):
+        raise ValueError("dispatch map must be contiguous colocated INT32 [E]")
     M, E = router_logits.shape
     topk_ids = torch.empty((M, topk), dtype=torch.int32, device=router_logits.device)
     topk_weights = torch.empty(
@@ -396,6 +416,7 @@ def invoke_sigmoid_bias_topk_route_gluon(
         correction_bias,
         topk_ids,
         topk_weights,
+        topk_ids if logical_to_physical_map is None else logical_to_physical_map,
         router_logits.stride(0),
         router_logits.stride(1),
         correction_bias.stride(0),
@@ -411,6 +432,7 @@ def invoke_sigmoid_bias_topk_route_gluon(
         TKP=_next_pow2(topk),
         NORMALIZE_TOPK_WEIGHTS=normalize_topk_weights,
         ROUTED_SCALING_FACTOR=float(routed_scaling_factor),
+        HAS_DISPATCH_MAP=logical_to_physical_map is not None,
         X_DTYPE=_ROUTE_GL_DTYPE[router_logits.dtype],
         NUM_WARPS=nw,
         num_warps=nw,
@@ -802,8 +824,12 @@ def _direct_mxfp4_load_tile(
     n_cols_s,
     x_scale_row,
     stride_xk,
+    stride_wk,
+    stride_wn,
     stride_xslin,
     stride_xsnb,
+    stride_wsk,
+    stride_wsn,
     stride_slin,
     stride_snb,
     N_PHYS,
@@ -812,6 +838,8 @@ def _direct_mxfp4_load_tile(
     K_PACKED: gl.constexpr,
     BLOCK_K_PACKED: gl.constexpr,
     BLOCK_K_SCALE: gl.constexpr,
+    LINEAR_WEIGHTS: gl.constexpr,
+    CONCAT_GATE_UP: gl.constexpr,
 ):
     """Load one direct MXFP4xMXFP4 K tile into MFMA operand layouts."""
     k_pack_a = kt * BLOCK_K_PACKED + ak
@@ -819,20 +847,37 @@ def _direct_mxfp4_load_tile(
     k_scale_a = kt * BLOCK_K_SCALE + ask
     k_scale_b = kt * BLOCK_K_SCALE + bsk
     a_off = x_row_off + k_pack_a.to(gl.int64) * stride_xk + am.to(gl.int64) * 0
-    b_off = _gluon_dot_preshuffled_w_offset(w_expert_off, k_pack_b, n_cols, N_PHYS)
+    if LINEAR_WEIGHTS:
+        linear_n = n_cols
+        linear_ns = n_cols_s
+        if CONCAT_GATE_UP:
+            linear_n = n_cols // 2 + (n_cols % 2) * (N_DIM // 2)
+            linear_ns = n_cols_s // 2 + (n_cols_s % 2) * (N_DIM // 2)
+        b_off = (
+            w_expert_off
+            + k_pack_b.to(gl.int64) * stride_wk
+            + linear_n.to(gl.int64) * stride_wn
+        )
+        b_scale_off = (
+            s_expert_off
+            + k_scale_b.to(gl.int64) * stride_wsk
+            + linear_ns.to(gl.int64) * stride_wsn
+        )
+    else:
+        b_off = _gluon_dot_preshuffled_w_offset(w_expert_off, k_pack_b, n_cols, N_PHYS)
+        b_scale_off = _cdna4_swizzled_mxfp4_scale_offset(
+            s_expert_off,
+            n_cols_s,
+            k_scale_b,
+            stride_slin,
+            stride_snb,
+        )
     a_scale_off = _cdna4_swizzled_mxfp4_scale_offset(
         0,
         x_scale_row + asm * 0,
         k_scale_a,
         stride_xslin,
         stride_xsnb,
-    )
-    b_scale_off = _cdna4_swizzled_mxfp4_scale_offset(
-        s_expert_off,
-        n_cols_s,
-        k_scale_b,
-        stride_slin,
-        stride_snb,
     )
     a = gl.amd.cdna4.buffer_load(
         ptr=x_ptr,
@@ -912,13 +957,33 @@ def _direct_swiglu_reduce(
 
 
 @gluon.jit
+def _direct_situ_reduce(
+    acc,
+    beta: gl.constexpr,
+    linear_beta: gl.constexpr,
+    OUT_BLOCK_N: gl.constexpr,
+):
+    block_m: gl.constexpr = acc.shape[0]
+    block_n: gl.constexpr = acc.shape[1]
+    split_layout: gl.constexpr = _direct_swiglu_split_layout(
+        block_m, block_n, gl.num_warps()
+    )
+    acc = gl.convert_layout(acc, split_layout)
+    gate, linear = gl.split(acc.reshape((block_m, OUT_BLOCK_N, 2)))
+    gate = beta * gl.extra.libdevice.tanh(gate / beta) / (1.0 + gl.exp(-gate))
+    linear = linear_beta * gl.extra.libdevice.tanh(linear / linear_beta)
+    return gate * linear
+
+
+@gluon.jit
 def _stage1_mxfp4_direct_mfma_gluon(
     hidden_ptr,  # (M, D/2) uint8 e2m1 packed, token order
     hidden_scale_ptr,  # (Kscale_pad*32, ceil(M/32)) uint8 CDNA4 swizzled
     w1_ptr,  # (E, D/2 padded, 2*I) uint8 gdot128-shuffled
     w1s_ptr,  # (E, Kscale*32, ceil((2*I)/32)) uint8 CDNA4-swizzled
     topk_ids_ptr,  # (M, TOPK) int32
-    out_ptr,  # (M*TOPK, I) bf16, slot order
+    out_ptr,  # (M*TOPK, I) bf16 or (M*TOPK, I/2) packed E2M1
+    out_scale_ptr,
     M,
     D,
     TWO_I,
@@ -928,11 +993,17 @@ def _stage1_mxfp4_direct_mfma_gluon(
     stride_xslin,
     stride_xsnb,
     stride_we,
+    stride_wk,
+    stride_wn,
     stride_se,
+    stride_wsk,
+    stride_wsn,
     stride_slin,
     stride_snb,
     stride_om,
     stride_on,
+    stride_oslin,
+    stride_osnb,
     stride_tit,
     stride_tis,
     K_PACKED: gl.constexpr,
@@ -943,6 +1014,14 @@ def _stage1_mxfp4_direct_mfma_gluon(
     SWIGLU_ALPHA: gl.constexpr,
     SWIGLU_LIMIT: gl.constexpr,
     SWIGLU_BETA: gl.constexpr,
+    SITU_BETA: gl.constexpr,
+    SITU_LINEAR_BETA: gl.constexpr,
+    USE_SITU: gl.constexpr,
+    QUANT_OUT: gl.constexpr,
+    EXPERT_START: gl.constexpr,
+    NUM_LOCAL_EXPERTS: gl.constexpr,
+    LINEAR_WEIGHTS: gl.constexpr,
+    CONCAT_GATE_UP: gl.constexpr,
 ):
     BLOCK_K_PACKED: gl.constexpr = BLOCK_K // 2
     BLOCK_K_SCALE: gl.constexpr = BLOCK_K // 32
@@ -952,6 +1031,11 @@ def _stage1_mxfp4_direct_mfma_gluon(
         "direct MXFP4 stage1 currently assumes one CDNA4 scaled-MFMA K tile",
     )
     gl.static_assert(BLOCK_N % 2 == 0, "SwiGLU stage1 needs even BLOCK_N")
+    if QUANT_OUT:
+        gl.static_assert(
+            OUT_BLOCK_N % 32 == 0,
+            "quantized stage1 output tiles must contain complete MXFP4 groups",
+        )
     gl.static_assert(
         128 % BLOCK_N == 0,
         "direct MXFP4 stage1 BLOCK_N must divide the gdot128 128-wide W tile",
@@ -963,7 +1047,9 @@ def _stage1_mxfp4_direct_mfma_gluon(
     pid_n = pid % num_n
     token = slot_flat // TOPK
     slot = slot_flat - token * TOPK
-    expert = gl.load(topk_ids_ptr + token * stride_tit + slot * stride_tis)
+    global_expert = gl.load(topk_ids_ptr + token * stride_tit + slot * stride_tis)
+    expert = global_expert - EXPERT_START
+    route_valid = (expert >= 0) & (expert < NUM_LOCAL_EXPERTS)
 
     layouts: gl.constexpr = _direct_mxfp4_mfma_layouts(M_DUP, BLOCK_N, BLOCK_K_SCALE)
     mfma_layout: gl.constexpr = layouts[0]
@@ -992,8 +1078,8 @@ def _stage1_mxfp4_direct_mfma_gluon(
     TOTAL_KT: gl.constexpr = gl.cdiv(K_PACKED, BLOCK_K_PACKED)
     acc = gl.zeros((M_DUP, BLOCK_N), dtype=gl.float32, layout=mfma_layout)
 
-    if token < M:
-        for kt in range(0, TOTAL_KT):
+    if (token < M) & route_valid:
+        for kt in range(TOTAL_KT):
             a, b, a_scale, b_scale = _direct_mxfp4_load_tile(
                 kt,
                 ak,
@@ -1013,8 +1099,12 @@ def _stage1_mxfp4_direct_mfma_gluon(
                 n_cols_s,
                 token,
                 stride_xk,
+                stride_wk,
+                stride_wn,
                 stride_xslin,
                 stride_xsnb,
+                stride_wsk,
+                stride_wsn,
                 stride_slin,
                 stride_snb,
                 N_PHYS,
@@ -1023,16 +1113,57 @@ def _stage1_mxfp4_direct_mfma_gluon(
                 K_PACKED,
                 BLOCK_K_PACKED,
                 BLOCK_K_SCALE,
+                LINEAR_WEIGHTS,
+                CONCAT_GATE_UP,
             )
             acc = _direct_mxfp4_mfma(acc, a, b, a_scale, b_scale)
 
-    out_tile = _direct_swiglu_reduce(
-        acc,
-        SWIGLU_ALPHA,
-        SWIGLU_LIMIT,
-        SWIGLU_BETA,
-        OUT_BLOCK_N,
-    )
+    if USE_SITU:
+        out_tile = _direct_situ_reduce(acc, SITU_BETA, SITU_LINEAR_BETA, OUT_BLOCK_N)
+    else:
+        out_tile = _direct_swiglu_reduce(
+            acc,
+            SWIGLU_ALPHA,
+            SWIGLU_LIMIT,
+            SWIGLU_BETA,
+            OUT_BLOCK_N,
+        )
+    if QUANT_OUT:
+        packed, scale = quantize_mxfp4_tile(out_tile)
+        packed = packed.reshape((M_DUP, OUT_BLOCK_N // 2))
+        packed_m = gl.arange(0, M_DUP, layout=gl.SliceLayout(1, packed.type.layout))[
+            :, None
+        ]
+        packed_n = gl.arange(
+            0, OUT_BLOCK_N // 2, layout=gl.SliceLayout(0, packed.type.layout)
+        )[None, :]
+        gl.store(
+            out_ptr
+            + slot_flat.to(gl.int64) * stride_om
+            + (pid_n * (OUT_BLOCK_N // 2) + packed_n).to(gl.int64) * stride_on
+            + packed_m.to(gl.int64) * 0,
+            packed,
+            mask=(token < M) & route_valid & (packed_m == 0),
+        )
+        scale_m = gl.arange(0, M_DUP, layout=gl.SliceLayout(1, scale.type.layout))[
+            :, None
+        ]
+        scale_k = (
+            pid_n * (OUT_BLOCK_N // 32)
+            + gl.arange(
+                0, OUT_BLOCK_N // 32, layout=gl.SliceLayout(0, scale.type.layout)
+            )[None, :]
+        )
+        store_cdna4_scale(
+            out_scale_ptr,
+            scale,
+            slot_flat + scale_m,
+            scale_k,
+            stride_oslin,
+            stride_osnb,
+            (token < M) & route_valid & (scale_m == 0),
+        )
+        return
     sm = gl.arange(0, M_DUP, layout=gl.SliceLayout(1, out_tile.type.layout))[:, None]
     sn = gl.arange(0, OUT_BLOCK_N, layout=gl.SliceLayout(0, out_tile.type.layout))[
         None, :
@@ -1044,7 +1175,7 @@ def _stage1_mxfp4_direct_mfma_gluon(
         + out_col.to(gl.int64) * stride_on
         + sm.to(gl.int64) * 0,
         out_tile.to(out_ptr.dtype.element_ty),
-        mask=(token < M) & (sm == 0) & (out_col < (TWO_I // 2)),
+        mask=(token < M) & route_valid & (sm == 0) & (out_col < (TWO_I // 2)),
     )
 
 
@@ -1062,6 +1193,8 @@ def invoke_stage1_mxfp4_mfma_decode_gluon(
     swiglu_alpha: float = 1.702,
     swiglu_limit: float = 7.0,
     swiglu_beta: float = 1.0,
+    situ_beta: float | None = None,
+    situ_linear_beta: float = 25.0,
 ):
     assert hidden_states_mxfp4.dtype == torch.uint8
     assert hidden_scale.dtype == torch.uint8
@@ -1090,6 +1223,7 @@ def invoke_stage1_mxfp4_mfma_decode_gluon(
         w1_scale,
         topk_ids,
         out,
+        out,
         num_tokens,
         D,
         two_I,
@@ -1099,9 +1233,15 @@ def invoke_stage1_mxfp4_mfma_decode_gluon(
         hidden_scale.stride(0),
         hidden_scale.stride(1),
         w1.stride(0),
+        w1.stride(1),
+        w1.stride(2),
         w1_scale.stride(0),
         w1_scale.stride(1),
         w1_scale.stride(2),
+        w1_scale.stride(1),
+        w1_scale.stride(2),
+        out.stride(0),
+        out.stride(1),
         out.stride(0),
         out.stride(1),
         topk_ids.stride(0),
@@ -1114,9 +1254,114 @@ def invoke_stage1_mxfp4_mfma_decode_gluon(
         SWIGLU_ALPHA=float(swiglu_alpha),
         SWIGLU_LIMIT=float(swiglu_limit),
         SWIGLU_BETA=float(swiglu_beta),
+        SITU_BETA=float(1.0 if situ_beta is None else situ_beta),
+        SITU_LINEAR_BETA=float(situ_linear_beta),
+        USE_SITU=situ_beta is not None,
+        QUANT_OUT=False,
+        EXPERT_START=0,
+        NUM_LOCAL_EXPERTS=int(w1.shape[0]),
+        LINEAR_WEIGHTS=False,
+        CONCAT_GATE_UP=False,
         num_warps=1,
     )
     return out
+
+
+def invoke_stage1_mxfp4_situ_quant_decode_gluon(
+    hidden_states_mxfp4,
+    hidden_scale,
+    w1,
+    w1_scale,
+    topk_ids,
+    out,
+    out_scale,
+    topk: int,
+    *,
+    situ_beta: float = 4.0,
+    situ_linear_beta: float = 25.0,
+    BLOCK_N: int = 64,
+    BLOCK_K: int = 128,
+    M_DUP: int = 4,
+    expert_start: int = 0,
+    linear_weights: bool = False,
+    w13_interleaved: bool = False,
+):
+    """Run K3 W13, SiTU, and MXFP4 requantization in one Gluon kernel."""
+    assert hidden_states_mxfp4.dtype == torch.uint8
+    assert hidden_scale.dtype == torch.uint8
+    assert w1.dtype == torch.uint8 and w1_scale.dtype == torch.uint8
+    assert out.dtype == torch.uint8 and out_scale.dtype == torch.uint8
+    num_tokens = int(hidden_states_mxfp4.shape[0])
+    if linear_weights:
+        _, two_intermediate, packed_hidden = w1.shape
+        n_phys = two_intermediate
+    else:
+        _, packed_hidden_phys, two_intermediate = w1.shape
+        packed_hidden = int(getattr(w1, "original_k_pk", packed_hidden_phys))
+        n_phys = int(w1.shape[2])
+    hidden_dim = packed_hidden * 2
+    intermediate = two_intermediate // 2
+    assert hidden_states_mxfp4.shape == (num_tokens, packed_hidden)
+    assert out.shape == (num_tokens * topk, intermediate // 2)
+    assert two_intermediate % BLOCK_N == 0 and BLOCK_N % 64 == 0
+    if linear_weights:
+        assert w1.is_contiguous() and w1_scale.is_contiguous()
+    else:
+        assert bool(getattr(w1, "is_shuffled_for_gluon_dot", False))
+        assert w1_scale.stride(-2) == 1
+    assert hidden_scale.stride(-2) == 1
+    assert out_scale.stride(-2) == 1
+    topk_ids = topk_ids.to(torch.int32)
+    grid = (num_tokens * topk * triton.cdiv(two_intermediate, BLOCK_N),)
+    _stage1_mxfp4_direct_mfma_gluon[grid](
+        hidden_states_mxfp4,
+        hidden_scale,
+        w1,
+        w1_scale,
+        topk_ids,
+        out,
+        out_scale,
+        num_tokens,
+        hidden_dim,
+        two_intermediate,
+        n_phys,
+        hidden_states_mxfp4.stride(0),
+        hidden_states_mxfp4.stride(1),
+        hidden_scale.stride(0),
+        hidden_scale.stride(1),
+        w1.stride(0),
+        w1.stride(2) if linear_weights else w1.stride(1),
+        w1.stride(1) if linear_weights else w1.stride(2),
+        w1_scale.stride(0),
+        w1_scale.stride(2) if linear_weights else w1_scale.stride(1),
+        w1_scale.stride(1) if linear_weights else w1_scale.stride(2),
+        w1_scale.stride(1),
+        w1_scale.stride(2),
+        out.stride(0),
+        out.stride(1),
+        out_scale.stride(0),
+        out_scale.stride(1),
+        topk_ids.stride(0),
+        topk_ids.stride(1),
+        K_PACKED=packed_hidden,
+        TOPK=topk,
+        BLOCK_K=BLOCK_K,
+        BLOCK_N=BLOCK_N,
+        M_DUP=M_DUP,
+        SWIGLU_ALPHA=1.0,
+        SWIGLU_LIMIT=0.0,
+        SWIGLU_BETA=0.0,
+        SITU_BETA=float(situ_beta),
+        SITU_LINEAR_BETA=float(situ_linear_beta),
+        USE_SITU=True,
+        QUANT_OUT=True,
+        EXPERT_START=int(expert_start),
+        NUM_LOCAL_EXPERTS=int(w1.shape[0]),
+        LINEAR_WEIGHTS=linear_weights,
+        CONCAT_GATE_UP=linear_weights and not w13_interleaved,
+        num_warps=1,
+    )
+    return out, out_scale
 
 
 @gluon.jit
@@ -1137,7 +1382,11 @@ def _stage2_mxfp4_direct_mfma_gluon(
     stride_xslin,
     stride_xsnb,
     stride_we,
+    stride_wk,
+    stride_wn,
     stride_se,
+    stride_wsk,
+    stride_wsn,
     stride_slin,
     stride_snb,
     stride_om,
@@ -1152,6 +1401,9 @@ def _stage2_mxfp4_direct_mfma_gluon(
     BLOCK_N: gl.constexpr,
     M_DUP: gl.constexpr,
     PIPELINE_K: gl.constexpr,
+    EXPERT_START: gl.constexpr,
+    NUM_LOCAL_EXPERTS: gl.constexpr,
+    LINEAR_WEIGHTS: gl.constexpr,
 ):
     BLOCK_K_PACKED: gl.constexpr = BLOCK_K // 2
     BLOCK_K_SCALE: gl.constexpr = BLOCK_K // 32
@@ -1192,7 +1444,11 @@ def _stage2_mxfp4_direct_mfma_gluon(
 
     if token < M:
         for slot in gl.static_range(0, TOPK):
-            expert = gl.load(topk_ids_ptr + token * stride_tit + slot * stride_tis)
+            global_expert = gl.load(
+                topk_ids_ptr + token * stride_tit + slot * stride_tis
+            )
+            expert = global_expert - EXPERT_START
+            route_valid = (expert >= 0) & (expert < NUM_LOCAL_EXPERTS)
             gate = gl.load(
                 topk_weights_ptr + token * stride_twt + slot * stride_tws
             ).to(gl.float32)
@@ -1202,7 +1458,7 @@ def _stage2_mxfp4_direct_mfma_gluon(
             s_expert_off = expert.to(gl.int64) * stride_se
             acc = gl.zeros((M_DUP, BLOCK_N), dtype=gl.float32, layout=mfma_layout)
 
-            if PIPELINE_K and TOTAL_KT > 1:
+            if route_valid & PIPELINE_K & (TOTAL_KT > 1):
                 # Hold one K tile in VGPRs while issuing the next tile's four
                 # global loads.  Kimi stage2 has only four tiles, so this small
                 # lookahead hides most VMEM waits without an LDS round trip.
@@ -1225,8 +1481,12 @@ def _stage2_mxfp4_direct_mfma_gluon(
                     n_cols_s,
                     row,
                     stride_ik,
+                    stride_wk,
+                    stride_wn,
                     stride_xslin,
                     stride_xsnb,
+                    stride_wsk,
+                    stride_wsn,
                     stride_slin,
                     stride_snb,
                     N_PHYS,
@@ -1235,8 +1495,10 @@ def _stage2_mxfp4_direct_mfma_gluon(
                     I_PACKED,
                     BLOCK_K_PACKED,
                     BLOCK_K_SCALE,
+                    LINEAR_WEIGHTS,
+                    False,
                 )
-                for kt in range(0, TOTAL_KT - 1):
+                for kt in range(TOTAL_KT - 1):
                     next_a, next_b, next_a_scale, next_b_scale = (
                         _direct_mxfp4_load_tile(
                             kt + 1,
@@ -1257,8 +1519,12 @@ def _stage2_mxfp4_direct_mfma_gluon(
                             n_cols_s,
                             row,
                             stride_ik,
+                            stride_wk,
+                            stride_wn,
                             stride_xslin,
                             stride_xsnb,
+                            stride_wsk,
+                            stride_wsn,
                             stride_slin,
                             stride_snb,
                             N_PHYS,
@@ -1267,6 +1533,8 @@ def _stage2_mxfp4_direct_mfma_gluon(
                             I_PACKED,
                             BLOCK_K_PACKED,
                             BLOCK_K_SCALE,
+                            LINEAR_WEIGHTS,
+                            False,
                         )
                     )
                     acc = _direct_mxfp4_mfma(acc, a, b, a_scale, b_scale)
@@ -1277,8 +1545,8 @@ def _stage2_mxfp4_direct_mfma_gluon(
                         next_b_scale,
                     )
                 acc = _direct_mxfp4_mfma(acc, a, b, a_scale, b_scale)
-            else:
-                for kt in range(0, TOTAL_KT):
+            elif route_valid:
+                for kt in range(TOTAL_KT):
                     a, b, a_scale, b_scale = _direct_mxfp4_load_tile(
                         kt,
                         ak,
@@ -1298,8 +1566,12 @@ def _stage2_mxfp4_direct_mfma_gluon(
                         n_cols_s,
                         row,
                         stride_ik,
+                        stride_wk,
+                        stride_wn,
                         stride_xslin,
                         stride_xsnb,
+                        stride_wsk,
+                        stride_wsn,
                         stride_slin,
                         stride_snb,
                         N_PHYS,
@@ -1308,6 +1580,8 @@ def _stage2_mxfp4_direct_mfma_gluon(
                         I_PACKED,
                         BLOCK_K_PACKED,
                         BLOCK_K_SCALE,
+                        LINEAR_WEIGHTS,
+                        False,
                     )
                     acc = _direct_mxfp4_mfma(acc, a, b, a_scale, b_scale)
             # Match the reference combine epilogue ordering.  Its GEMM kernel first
@@ -1346,21 +1620,29 @@ def invoke_stage2_mxfp4_mfma_decode_gluon(
     BLOCK_K: int = 128,
     M_DUP: int = 4,
     PIPELINE_K: bool = True,
+    expert_start: int = 0,
+    linear_weights: bool = False,
 ):
     assert inter_states_mxfp4.dtype == torch.uint8
     assert inter_scale.dtype == torch.uint8
     assert w2.dtype == torch.uint8 and w2_scale.dtype == torch.uint8
     assert out.dtype == torch.bfloat16
-    _, Ih_phys, N_phys = w2.shape
-    Ih = int(getattr(w2, "original_k_pk", Ih_phys))
+    if linear_weights:
+        _, N_phys, Ih = w2.shape
+    else:
+        _, Ih_phys, N_phys = w2.shape
+        Ih = int(getattr(w2, "original_k_pk", Ih_phys))
     I_r = Ih * 2
     num_tokens, D = out.shape
     assert inter_states_mxfp4.shape == (num_tokens * topk, Ih)
     assert D <= N_phys
-    assert bool(getattr(w2, "is_shuffled_for_gluon_dot", False))
-    assert int(getattr(w2, "gluon_dot_block_k_pk", 0)) == 128
-    assert int(getattr(w2, "gluon_dot_block_n", 0)) == 128
-    assert w2_scale.stride(-2) == 1
+    if linear_weights:
+        assert w2.is_contiguous() and w2_scale.is_contiguous()
+    else:
+        assert bool(getattr(w2, "is_shuffled_for_gluon_dot", False))
+        assert int(getattr(w2, "gluon_dot_block_k_pk", 0)) == 128
+        assert int(getattr(w2, "gluon_dot_block_n", 0)) == 128
+        assert w2_scale.stride(-2) == 1
     assert inter_scale.stride(-2) == 1
     topk_ids = topk_ids.to(torch.int32)
     topk_weights = topk_weights.to(torch.float32)
@@ -1382,7 +1664,11 @@ def invoke_stage2_mxfp4_mfma_decode_gluon(
         inter_scale.stride(0),
         inter_scale.stride(1),
         w2.stride(0),
+        w2.stride(2) if linear_weights else w2.stride(1),
+        w2.stride(1) if linear_weights else w2.stride(2),
         w2_scale.stride(0),
+        w2_scale.stride(2) if linear_weights else w2_scale.stride(1),
+        w2_scale.stride(1) if linear_weights else w2_scale.stride(2),
         w2_scale.stride(1),
         w2_scale.stride(2),
         out.stride(0),
@@ -1397,6 +1683,9 @@ def invoke_stage2_mxfp4_mfma_decode_gluon(
         BLOCK_N=BLOCK_N,
         M_DUP=M_DUP,
         PIPELINE_K=PIPELINE_K,
+        EXPERT_START=int(expert_start),
+        NUM_LOCAL_EXPERTS=int(w2.shape[0]),
+        LINEAR_WEIGHTS=linear_weights,
         num_warps=1,
     )
     return out

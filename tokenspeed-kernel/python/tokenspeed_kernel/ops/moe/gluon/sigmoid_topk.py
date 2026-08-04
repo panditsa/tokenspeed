@@ -47,11 +47,13 @@ if invoke_sigmoid_bias_topk_route_prefill_gluon is not None:
         topk: int,
         routed_scaling_factor: float,
         normalize_topk_weights: bool,
+        logical_to_physical_map: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        kimi3_shape = router_logits.shape[1] == 896 and topk == 16
         route = (
-            invoke_sigmoid_bias_topk_route_gluon
-            if router_logits.shape[0] * topk <= 128
-            else invoke_sigmoid_bias_topk_route_prefill_gluon
+            invoke_sigmoid_bias_topk_route_prefill_gluon
+            if kimi3_shape or router_logits.shape[0] * topk > 128
+            else invoke_sigmoid_bias_topk_route_gluon
         )
         topk_ids, topk_weights = route(
             router_logits,
@@ -59,6 +61,7 @@ if invoke_sigmoid_bias_topk_route_prefill_gluon is not None:
             topk,
             routed_scaling_factor=routed_scaling_factor,
             normalize_topk_weights=normalize_topk_weights,
+            logical_to_physical_map=logical_to_physical_map,
         )
         return topk_weights, topk_ids
 
