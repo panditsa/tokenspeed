@@ -41,6 +41,7 @@ class _Trace(nn.Module):
 class _Add3Up(_Trace):
     def __init__(self, events: list[str]) -> None:
         super().__init__(events, "up")
+        self.weight = nn.Parameter(torch.ones(4, 2))
 
     def forward_add3(
         self,
@@ -51,6 +52,13 @@ class _Add3Up(_Trace):
         self.events.append("up_add3")
         routed_output, _ = _up(routed_latent)
         return prefix_sum + routed_output + shared_output
+
+
+class _WeightedNorm(_Trace):
+    def __init__(self, events: list[str]) -> None:
+        super().__init__(events, "norm")
+        self.weight = nn.Parameter(torch.ones(2))
+        self.variance_epsilon = 1e-6
 
 
 class _TopK(nn.Module):
@@ -477,11 +485,80 @@ def test_latent_moe_can_return_separate_residual_components() -> None:
     torch.testing.assert_close(shared, hidden_states * 4)
 
 
-def test_latent_moe_fuses_output_projection_addends() -> None:
+def test_latent_moe_fuses_output_projection_addends_without_norm() -> None:
     events: list[str] = []
     layer = _layer(
         events,
-        routed_norm=_Trace(events, "norm"),
+        shared_experts=_Trace(events, "shared"),
+        routed_up_proj=_Add3Up(events),
+    )
+    hidden_states = torch.arange(12, dtype=torch.float32).view(3, 4)
+    prefix_sum = torch.full_like(hidden_states, 7)
+
+    actual = layer(hidden_states, prefix_sum=prefix_sum)
+
+    routed_latent = hidden_states[:, :2] + 1
+    routed_output, _ = _up(routed_latent)
+    expected = prefix_sum + routed_output + hidden_states * 4
+    torch.testing.assert_close(actual, expected)
+    assert "up_add3" in events
+    assert "up" not in events
+
+
+def test_latent_moe_fuses_norm_output_projection_addends(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    calls: list[tuple[torch.Tensor, ...]] = []
+
+    def fused_norm_projection(
+        routed_latent: torch.Tensor,
+        norm_weight: torch.Tensor,
+        projection_weight: torch.Tensor,
+        prefix_sum: torch.Tensor,
+        shared_output: torch.Tensor,
+        *,
+        eps: float,
+    ) -> torch.Tensor:
+        del norm_weight, projection_weight
+        events.append("norm_up_add3")
+        calls.append((routed_latent, prefix_sum, shared_output))
+        assert eps == 1e-6
+        routed_output, _ = _up(routed_latent + 3)
+        return prefix_sum + routed_output + shared_output
+
+    monkeypatch.setattr(
+        latent_module.tokenspeed_kernel,
+        "rmsnorm_linear_add",
+        fused_norm_projection,
+    )
+    layer = _layer(
+        events,
+        routed_norm=_WeightedNorm(events),
+        shared_experts=_Trace(events, "shared"),
+        routed_up_proj=_Add3Up(events),
+    )
+    hidden_states = torch.arange(4, dtype=torch.float32).view(1, 4)
+    prefix_sum = torch.full_like(hidden_states, 7)
+
+    actual = layer(hidden_states, prefix_sum=prefix_sum)
+
+    routed_latent = hidden_states[:, :2] + 4
+    routed_output, _ = _up(routed_latent)
+    expected = prefix_sum + routed_output + hidden_states * 4
+    torch.testing.assert_close(actual, expected)
+    assert len(calls) == 1
+    assert "norm_up_add3" in events
+    assert "up_add3" not in events
+    assert "norm" not in events
+    assert "up" not in events
+
+
+def test_latent_moe_preserves_multi_token_norm_add3_path() -> None:
+    events: list[str] = []
+    layer = _layer(
+        events,
+        routed_norm=_WeightedNorm(events),
         shared_experts=_Trace(events, "shared"),
         routed_up_proj=_Add3Up(events),
     )
@@ -494,7 +571,9 @@ def test_latent_moe_fuses_output_projection_addends() -> None:
     routed_output, _ = _up(routed_latent)
     expected = prefix_sum + routed_output + hidden_states * 4
     torch.testing.assert_close(actual, expected)
+    assert "norm" in events
     assert "up_add3" in events
+    assert "norm_up_add3" not in events
     assert "up" not in events
 
 
