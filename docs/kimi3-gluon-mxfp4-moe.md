@@ -45,8 +45,8 @@ TOKENSPEED_KIMI3_GLUON_A4W4=1
 
 It retains the existing A16W4 warp-GEMV path for M <= 4, uses A4W4 for
 M = 5..15, and uses grouped A16W4 at M >= 16. The A4W4 path
-keeps an additional MFMA-native copy of W13 and W2, so its current memory cost
-is too high for unconditional enablement.
+reads the checkpoint's existing linear W13 and W2 storage, avoiding an
+additional model-sized MFMA-native weight copy.
 
 ## Techniques adopted
 
@@ -62,9 +62,9 @@ packed-key Triton route.
 
 ## Results
 
-The focused MoE benchmark uses the K3 EP8 local shape with two locally owned
-routes per token. The preshuffled A4W4 kernel is faster than A16W4 throughout
-the tested M = 5..16 range:
+The original focused MoE benchmark used the K3 EP8 local shape with two
+locally owned routes per token. With preshuffled weights, A4W4 was faster than
+A16W4 throughout the tested M = 5..16 range:
 
 | M | A16W4 (us) | A4W4 (us) | Speedup |
 | ---: | ---: | ---: | ---: |
@@ -73,37 +73,43 @@ the tested M = 5..16 range:
 | 12 | 317.83 | 111.62 | 2.85x |
 | 16 | 397.08 | 135.32 | 2.93x |
 
-The end-to-end benchmark uses K3 TP8/EP8, a 4096-token prompt, a 1024-token
-completion, graph mode, and the median of three repetitions:
+On the current collective-lanes and single-group-routing stack, retaining a
+second preshuffled model-wide weight copy exceeds available device memory.
+The integrated path therefore consumes the existing linear checkpoint
+weights. A matched M=8 4K/1K graph-mode A/B, with three repetitions per arm,
+measured:
 
-| M | Base tok/s | New tok/s | Change | Base TPOT | New TPOT |
+| M=8 path | Output tok/s | TTFT | TPOT |
+| --- | ---: | ---: | ---: |
+| Grouped A16W4 | 164.59 | 2847.37 ms | 45.85 ms |
+| Linear-weight A4W4 | 166.37 | 2845.92 ms | 45.35 ms |
+| Change | +1.08% | -0.05% | -1.10% |
+
+The A4W4 gain remains positive but is much smaller than the earlier
+preshuffled result. Its unchanged TTFT is expected: A4W4 is selected only for
+5-15 decode tokens, while the 4K prefill stays on grouped A16W4.
+
+Relative to the preceding stacked commit, the complete change produced the
+following medians. These rows also include the new K3 routing path, so only
+M=8 exercises A4W4.
+
+| M | Before tok/s | After tok/s | Change | Before TPOT | After TPOT |
 | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 44.26 | 44.98 | +1.63% | 22.05 ms | 21.66 ms |
-| 2 | 58.53 | 63.86 | +9.11% | 33.25 ms | 30.39 ms |
-| 4 | 98.50 | 109.14 | +10.80% | 38.94 ms | 34.98 ms |
+| 1 | 49.39 | 47.93 | -2.96% | 19.80 ms | 20.41 ms |
+| 2 | 62.15 | 65.38 | +5.20% | 31.44 ms | 29.87 ms |
+| 4 | 109.38 | 111.35 | +1.80% | 35.23 ms | 34.58 ms |
+| 8 | 157.52 | 165.55 | +5.10% | 48.03 ms | 45.57 ms |
+| 16 | 225.54 | 227.64 | +0.93% | 65.15 ms | 64.51 ms |
 
-These M <= 4 rows retain the existing A16W4 expert kernels and measure the
-new Gluon routing path. A4W4 is active in the following rows:
-
-| M | A16W4 tok/s | A4W4 tok/s | Change | A16W4 TPOT | A4W4 TPOT |
-| ---: | ---: | ---: | ---: | ---: | ---: |
-| 8 | 89.64 | 96.14 | +7.25% | 83.36 ms | 77.35 ms |
-| 16 | 145.58 | 146.71 | +0.78% | 100.51 ms | 99.70 ms |
-
-The M=16 A4W4 gain was too small to justify automatic selection, so M=16
-remains on the stable grouped A16W4 path. A direct FP32-to-MXFP4 packing
-experiment exposed a reproducible larger-grid graph-capture fault and is not
-included. The current A4W4 dispatch range remains experimental.
+M=16 remains on grouped A16W4. The A4W4 dispatch range remains experimental.
 
 ## Validation
 
-- 66 gfx950 MXFP4 kernel tests passed.
-- 13 K3 prefill and routing tests passed.
-- 79 kernel-selection tests passed; 33 were skipped.
-- The M=8 coherence canary completed 8/8 requests for 256 output tokens with
-  coherent responses.
-- Exact tests cover quantization, linear versus preshuffled weights, fused
-  SiTU requantization, EP dispatch, and runtime path selection.
+- 158 focused kernel, routing, and selection tests passed; 44 were skipped.
+- The full graph-mode sweep completed all 93 requests with exact 4096-token
+  inputs and 1024-token outputs.
+- Exact tests cover activation quantization, linear versus preshuffled weights,
+  EP dispatch, and runtime path selection.
 
 Activation requantization can change output hashes relative to A16W4. Semantic
 coherence and numerical kernel references, rather than bitwise model output

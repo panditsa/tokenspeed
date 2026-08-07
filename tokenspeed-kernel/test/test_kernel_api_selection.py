@@ -1565,10 +1565,6 @@ def _make_kimi3_experimental_a4w4_layer() -> torch.nn.Module:
     w.w13_weight_scale = torch.empty((2, 64, 2), dtype=torch.uint8)
     w.w2_weight = torch.empty((2, 64, 16), dtype=torch.uint8)
     w.w2_weight_scale = torch.empty((2, 64, 1), dtype=torch.uint8)
-    w._kimi3_a4w4_w13_weight = object()
-    w._kimi3_a4w4_w13_scale = object()
-    w._kimi3_a4w4_w2_weight = object()
-    w._kimi3_a4w4_w2_scale = object()
     w.activation_situ_beta = 4.0
     w.activation_situ_linear_beta = 25.0
     w.num_local_experts = 2
@@ -1577,7 +1573,7 @@ def _make_kimi3_experimental_a4w4_layer() -> torch.nn.Module:
     return w
 
 
-def test_kimi3_experimental_a4w4_dispatch_uses_preshuffled_weights(
+def test_kimi3_experimental_a4w4_dispatch_uses_linear_weights(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     if not hasattr(_moe_gluon_mxfp4, "gluon_mxfp4_a16w4_situ_ep_precomputed_moe_apply"):
@@ -1585,10 +1581,12 @@ def test_kimi3_experimental_a4w4_dispatch_uses_preshuffled_weights(
 
     w = _make_kimi3_experimental_a4w4_layer()
     captured: tuple[object, ...] | None = None
+    captured_kwargs: dict[str, object] | None = None
 
     def fake_a4w4(*args, **kwargs):
-        nonlocal captured
+        nonlocal captured, captured_kwargs
         captured = args
+        captured_kwargs = kwargs
         return "a4w4"
 
     monkeypatch.setattr(_moe_gluon_mxfp4, "_KIMI3_A4W4_DECODE", True)
@@ -1605,11 +1603,14 @@ def test_kimi3_experimental_a4w4_dispatch_uses_preshuffled_weights(
     assert out == "a4w4"
     assert captured is not None
     assert captured[1:5] == (
-        w._kimi3_a4w4_w13_weight,
-        w._kimi3_a4w4_w13_scale,
-        w._kimi3_a4w4_w2_weight,
-        w._kimi3_a4w4_w2_scale,
+        w.w13_weight,
+        w.w13_weight_scale,
+        w.w2_weight,
+        w.w2_weight_scale,
     )
+    assert captured_kwargs is not None
+    assert captured_kwargs["linear_weights"] is True
+    assert captured_kwargs["w13_interleaved"] is False
 
 
 def test_kimi3_experimental_a4w4_dispatch_excludes_m16(

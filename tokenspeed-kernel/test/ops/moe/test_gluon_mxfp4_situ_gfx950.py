@@ -38,7 +38,16 @@ def _is_gfx950() -> bool:
 if not _is_gfx950():
     pytest.skip("MXFP4 SiTU Gluon tests require gfx950", allow_module_level=True)
 
-import tokenspeed_kernel  # noqa: E402
+import tokenspeed_kernel
+from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused import (
+    shuffle_weight_for_gluon_dot_layout,
+)
+from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.moe import (
+    gluon_mxfp4_situ_moe_decode,
+)
+from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.scale_layout import (
+    swizzle_cdna4_mxfp4_scale,
+)
 
 
 def _make_mxfp4_module(
@@ -532,3 +541,43 @@ def test_mxfp4_situ_ep_paths_are_cuda_graph_capturable_gfx950(
     graph.replay()
     torch.cuda.synchronize()
     torch.testing.assert_close(captured, eager, atol=3e-2, rtol=3e-2)
+
+
+def test_a4w4_linear_weights_match_preshuffled_weights_gfx950() -> None:
+    generator = torch.Generator(device="cuda").manual_seed(20260807)
+    raw = make_mxfp4_moe_weights(8, 1024, 512, generator)
+    hidden = torch.randn(
+        (8, 1024), dtype=torch.bfloat16, device="cuda", generator=generator
+    )
+    topk_weights, topk_ids = make_round_robin_topk(8, 8, 2)
+
+    def interleave(tensor: torch.Tensor) -> torch.Tensor:
+        gate, up = tensor.chunk(2, dim=1)
+        return torch.stack((gate, up), dim=2).flatten(1, 2).contiguous()
+
+    def preshuffle(tensor: torch.Tensor) -> torch.Tensor:
+        return shuffle_weight_for_gluon_dot_layout(
+            tensor.transpose(-2, -1).contiguous()
+        )
+
+    expected = gluon_mxfp4_situ_moe_decode(
+        hidden,
+        preshuffle(interleave(raw["w13_weight"])),
+        swizzle_cdna4_mxfp4_scale(interleave(raw["w13_scale"])),
+        preshuffle(raw["w2_weight"]),
+        swizzle_cdna4_mxfp4_scale(raw["w2_scale"]),
+        topk_ids,
+        topk_weights,
+    )
+    actual = gluon_mxfp4_situ_moe_decode(
+        hidden,
+        raw["w13_weight"],
+        raw["w13_scale"],
+        raw["w2_weight"],
+        raw["w2_scale"],
+        topk_ids,
+        topk_weights,
+        linear_weights=True,
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
