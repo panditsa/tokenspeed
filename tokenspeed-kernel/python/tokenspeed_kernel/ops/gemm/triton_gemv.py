@@ -50,6 +50,7 @@ def _rowcta_gemv_add3_kernel(
     out_ptr,
     K: tl.constexpr,
     BK: tl.constexpr,
+    MATERIALIZE_PROJECTION: tl.constexpr,
 ):
     """Row dot-product with a fused two-addend epilogue:
     ``out[n] = a[n] + x . w[n] + c[n]`` (the MoE residual accumulate rides
@@ -62,11 +63,14 @@ def _rowcta_gemv_add3_kernel(
         xv = tl.load(x_ptr + offs, mask=mask, other=0.0).to(tl.float32)
         wv = tl.load(w_ptr + n * K + offs, mask=mask, other=0.0).to(tl.float32)
         acc += wv * xv
+    projected = tl.sum(acc)
+    if MATERIALIZE_PROJECTION:
+        projected = projected.to(out_ptr.dtype.element_ty).to(tl.float32)
     av = tl.load(a_ptr + n).to(tl.float32)
     cv = tl.load(c_ptr + n).to(tl.float32)
     tl.store(
         out_ptr + n,
-        (av + tl.sum(acc) + cv).to(out_ptr.dtype.element_ty),
+        (av + projected + cv).to(out_ptr.dtype.element_ty),
     )
 
 
@@ -213,6 +217,8 @@ def rowcta_gemv_add3(
     a: torch.Tensor,
     c: torch.Tensor,
     out: torch.Tensor | None = None,
+    *,
+    materialize_projection: bool = False,
 ) -> torch.Tensor:
     """``a + x @ weight.T + c`` for ``M == 1`` (fused MoE residual epilogue).
 
@@ -220,6 +226,8 @@ def rowcta_gemv_add3(
         x: ``[1, K]`` bf16 latent row; weight: ``[N, K]``.
         a/c: ``[1, N]`` addends (``c`` may be a wider-lane column slice --
             only unit inner stride is required).
+        materialize_projection: Round the projection to the output dtype
+            before accumulating the addends.
 
     Returns:
         ``[1, N]`` prefix row.
@@ -237,6 +245,7 @@ def rowcta_gemv_add3(
         out,
         K=k,
         BK=512,
+        MATERIALIZE_PROJECTION=materialize_projection,
         num_warps=4,
     )
     return out

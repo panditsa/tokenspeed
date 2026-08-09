@@ -5,10 +5,12 @@
 from types import SimpleNamespace
 from unittest import mock
 
+import pytest
 import torch
 from tokenspeed_kernel.ops.gemm import kimi3 as kimi3_module
 from tokenspeed_kernel.ops.gemm import (
     kimi3_latent_projection,
+    kimi3_latent_projection_add3,
     kimi3_mla_qkv_gate_projection,
     kimi3_qkvfab_projection,
     kimi3_router_projection,
@@ -50,12 +52,60 @@ def test_kimi3_latent_projection_falls_back_for_noncanonical_shape() -> None:
     torch.testing.assert_close(actual, expected)
 
 
+def test_kimi3_latent_projection_add3_composes_into_out() -> None:
+    hidden_states = torch.randn(3, 5)
+    weight = torch.randn(7, 5)
+    addend_a = torch.randn(3, 7)
+    addend_c = torch.randn(3, 7)
+    output = torch.empty(3, 7)
+
+    returned = kimi3_latent_projection_add3(
+        hidden_states,
+        weight,
+        addend_a,
+        addend_c,
+        out=output,
+    )
+
+    assert returned.data_ptr() == output.data_ptr()
+    expected = addend_a + torch.nn.functional.linear(hidden_states, weight) + addend_c
+    torch.testing.assert_close(output, expected)
+
+
 def test_kimi3_router_projection_falls_back_for_noncanonical_shape() -> None:
     hidden_states = torch.randn(3, 64, dtype=torch.bfloat16)
     weight = torch.randn(8, 64, dtype=torch.bfloat16)
-    actual = kimi3_router_projection(hidden_states, weight)
+    output = torch.empty(3, 8)
+    actual = kimi3_router_projection(hidden_states, weight, out=output)
     expected = torch.nn.functional.linear(hidden_states.float(), weight.float())
+    assert actual.data_ptr() == output.data_ptr()
     torch.testing.assert_close(actual, expected)
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("hidden_size", [3072, 6144, 7168])
+def test_kimi3_router_projection_generalizes_dsv3_hidden_sizes(
+    hidden_size: int,
+) -> None:
+    platform = SimpleNamespace(is_cdna4=False, is_hopper_plus=True)
+    hidden_states = torch.randn(1, hidden_size, dtype=torch.bfloat16)
+    weight = torch.randn(11, hidden_size, dtype=torch.bfloat16)
+    expected = torch.empty(1, 11, dtype=torch.float32)
+    with (
+        mock.patch.object(kimi3_module.Platform, "get", return_value=platform),
+        mock.patch.object(
+            type(hidden_states), "is_cuda", new_callable=mock.PropertyMock
+        ) as is_cuda,
+        mock.patch(
+            "tokenspeed_kernel.ops.gemm.cuda.dsv3_router_gemm",
+            return_value=expected,
+        ) as dsv3,
+    ):
+        is_cuda.return_value = True
+        actual = kimi3_router_projection(hidden_states, weight)
+
+    assert actual is expected
+    dsv3.assert_called_once()
 
 
 def test_kimi3_router_projection_auto_splits_on_token_count() -> None:

@@ -172,6 +172,11 @@ Notes:
   selects the existing FLA-derived NVIDIA implementation or the native AMD
   implementation, including each backend's preferred recurrent-state layout.
   The runtime does not transpose or reinterpret that state.
+- Decode fusions use tensor-level contracts rather than model-name or
+  environment-flag dispatch. Unsupported devices, dtypes, shapes, and layouts
+  retain portable composed implementations.
+- Fused kernels preserve the split path's materialization boundaries, including
+  BF16 rounding before downstream projections and residual accumulation.
 - NVIDIA auto-selects `--attention-backend tokenspeed_mla` for K3
   (fp8 KV required). AMD uses the `mla` backend.
 - `tokenspeed serve` auto-selects the `kimi_k3` reasoning and tool-call
@@ -261,9 +266,10 @@ On gfx950, the replicated 7168↔3584 latent projections automatically select
 among a one-token Triton GEMV, tuned Gluon GEMMs, and the vendor GEMM according
 to the current token count. At TP8/EP8, eligible one-token decode also combines
 the routed MXFP4 experts with the shared-expert down projection, then applies
-their joint reduction before the fused latent up-projection epilogue. Other
-shapes and unsupported layouts retain the ordinary composed path. The fused
-sigmoid-bias top-k route supports the full scheduled token count.
+their joint reduction before the fused latent up-projection epilogue. The same
+projection API accepts an explicit output buffer and falls back to the ordinary
+composition for unsupported layouts. The fused sigmoid-bias top-k route
+supports the full scheduled token count.
 
 ## GLM5 / GLM5.2
 

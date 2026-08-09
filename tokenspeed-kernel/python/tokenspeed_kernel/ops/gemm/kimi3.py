@@ -309,10 +309,10 @@ def kimi3_latent_projection(
             solution = "gluon_largem"
         else:
             solution = "torch"
-    elif solution != "torch" and not specialized:
+    if solution != "torch" and not specialized:
         raise ValueError(
-            f"Kimi K3 {solution} latent projection requires a contiguous gfx950 "
-            "BF16 7168<->3584 shape"
+            f"Kimi K3 {solution} latent projection requires a supported "
+            "contiguous GPU BF16 7168<->3584 shape"
         )
     if solution == "triton_gemv":
         return _triton_projection_gemv(
@@ -401,15 +401,17 @@ def kimi3_latent_projection_add3(
     prefix: torch.Tensor,
     shared_output: torch.Tensor,
     *,
+    out: torch.Tensor | None = None,
     solution: str = "auto",
 ) -> torch.Tensor:
-    """Project K3 latent rows and add the residual and shared-expert output.
+    """Project latent rows and add the residual and shared-expert output.
 
     Args:
-        hidden_states: Contiguous BF16 latent rows shaped ``[M, K]``.
-        weight: Contiguous BF16 projection weight shaped ``[N, K]``.
-        prefix: BF16 residual rows shaped ``[M, N]``.
-        shared_output: BF16 shared-expert rows shaped ``[M, N]``.
+        hidden_states: Latent rows shaped ``[M, K]``.
+        weight: Projection weight shaped ``[N, K]``.
+        prefix: Residual rows shaped ``[M, N]``.
+        shared_output: Shared-expert rows shaped ``[M, N]``.
+        out: Optional destination shaped ``[M, N]``.
         solution: ``"auto"`` selects the fused row-CTA GEMV for one-token
             execution, the fused MFMA epilogue for the tuned M=16 tile, and
             otherwise composes the registered projection and add kernels.
@@ -423,7 +425,7 @@ def kimi3_latent_projection_add3(
     m, n, k = _validate_fallback_projection(
         hidden_states,
         weight,
-        None,
+        out,
         name="Kimi K3 latent projection-add3",
     )
     expected_shape = (m, n)
@@ -455,7 +457,12 @@ def kimi3_latent_projection_add3(
     if solution == "auto":
         if m == 1 and specialized:
             solution = "rowcta_gemv"
-        elif Platform.get().is_cdna4 and m == 16 and specialized:
+        elif (
+            Platform.get().is_cdna4
+            and m == 16
+            and specialized
+            and (k, n) == (KIMI3_LATENT_SIZE, KIMI3_HIDDEN_SIZE)
+        ):
             solution = "gluon_mfma_add3"
         else:
             solution = "composed"
@@ -474,9 +481,16 @@ def kimi3_latent_projection_add3(
             weight,
             prefix,
             shared_output,
+            out=out,
+            materialize_projection=Platform.get().is_cdna4,
         )
     if solution == "gluon_mfma_add3":
-        if not Platform.get().is_cdna4 or m != 16 or not specialized:
+        if (
+            not Platform.get().is_cdna4
+            or m != 16
+            or not specialized
+            or (k, n) != (KIMI3_LATENT_SIZE, KIMI3_HIDDEN_SIZE)
+        ):
             raise ValueError(
                 "gluon_mfma_add3 projection-add3 requires 16 contiguous CUDA "
                 "BF16 rows with the K3 3584->7168 shape on CDNA4"
@@ -485,17 +499,21 @@ def kimi3_latent_projection_add3(
             gluon_mm_a16w16_add3_m16_gfx950,
         )
 
-        return gluon_mm_a16w16_add3_m16_gfx950(
+        result = gluon_mm_a16w16_add3_m16_gfx950(
             hidden_states,
             weight,
             prefix,
             shared_output,
         )
+    else:
+        projected = kimi3_latent_projection(hidden_states, weight)
+        from tokenspeed_kernel.ops.activation.triton import add3
 
-    projected = kimi3_latent_projection(hidden_states, weight)
-    from tokenspeed_kernel.ops.activation.triton import add3
-
-    return add3(prefix, projected, shared_output)
+        result = add3(prefix, projected, shared_output)
+    if out is None:
+        return result
+    out.copy_(result)
+    return out
 
 
 def kimi3_shared_situ_projection(
@@ -510,16 +528,16 @@ def kimi3_shared_situ_projection(
     """Apply K3's TP8 local shared-expert gate/up projection and SiTU.
 
     Args:
-        hidden_states: Contiguous BF16 activation shaped ``[M, 7168]``.
+        hidden_states: Activation shaped ``[M, K]``.
         gate_up_weight: Contiguous BF16 TP8 shard shaped ``[1536, 7168]``.
         beta: Positive SiTU gate soft-clipping scale.
         linear_beta: Optional positive SiTU up-branch soft-clipping scale.
-        out: Optional contiguous BF16 output shaped ``[M, 768]``.
+        out: Optional output shaped ``[M, N/2]``.
         solution: ``"auto"`` selects the fused gfx950 kernel and otherwise
             uses the portable Torch projection plus TokenSpeed SiTU kernel.
 
     Returns:
-        The local activated shared-expert rows shaped ``[M, 768]``.
+        The local activated shared-expert rows shaped ``[M, N/2]``.
     """
 
     m, gate_up_width, hidden_width = _validate_fallback_projection(
@@ -613,14 +631,14 @@ def kimi3_shared_down_projection(
     """Apply K3's TP8 local shared-expert down projection.
 
     Args:
-        hidden_states: Contiguous BF16 activated rows shaped ``[M, 768]``.
-        weight: Contiguous BF16 TP8 shard shaped ``[7168, 768]``.
-        out: Optional contiguous BF16 output shaped ``[M, 7168]``.
+        hidden_states: Activated rows shaped ``[M, K]``.
+        weight: Down-projection weight shaped ``[N, K]``.
+        out: Optional contiguous output shaped ``[M, N]``.
         solution: ``"auto"`` selects the gfx950 decode GEMV and otherwise
             uses the portable Torch linear operation.
 
     Returns:
-        The local shared-expert output contribution shaped ``[M, 7168]``.
+        The local shared-expert output contribution shaped ``[M, N]``.
     """
 
     m, output_width, input_width = _validate_fallback_projection(
@@ -741,6 +759,7 @@ def kimi3_qkvfab_projection(
 # Largest token count the hand-written router CUDA kernel still wins at; the
 # tensor-core GEMM takes over above it (see kimi3_router_projection docstring).
 _ROUTER_CUDA_MAX_TOKENS = 4
+_ROUTER_TRITON_MAX_TOKENS = 16
 
 
 @lru_cache(maxsize=1)
@@ -765,24 +784,19 @@ def kimi3_router_projection(
     solution: str = "auto",
     enable_pdl: bool = False,
 ) -> torch.Tensor:
-    """Compute K3's BF16-input/BF16-weight router logits directly in FP32.
+    """Compute router logits in FP32 with platform-local selection.
 
     Args:
-        hidden_states: BF16 activation shaped ``[M, 7168]``.
-        weight: BF16 router weight shaped ``[896, 7168]``.
-        out: Optional contiguous FP32 output buffer shaped ``[M, 896]``.
-        solution: ``"auto"`` selects a specialized CDNA4 or Hopper kernel
-            when eligible and otherwise falls back to Torch. On NVIDIA the
-            hand-written CUDA kernel serves ``M <= 4`` and ``"cublas"``
-            (``torch.mm`` with ``out_dtype``) serves larger batches: the CUDA
-            kernel's per-thread token loop runs on CUDA cores, so its time
-            grows linearly with M (4.0us at M=1 -> 34.8us at M=32 on B300)
-            while the tensor-core GEMM stays flat (~7.3us), crossing between
-            M=4 and M=8.
+        hidden_states: Router activation shaped ``[M, K]``.
+        weight: Router weight shaped ``[E, K]``.
+        out: Optional contiguous FP32 output buffer shaped ``[M, E]``.
+        solution: ``"auto"`` uses the gfx950 GEMV through M=16, or the Hopper
+            DSV3 kernel through M=4 and cuBLAS above it. Other inputs fall back
+            to Torch.
         enable_pdl: Enable programmatic dependent launch for the CUDA kernel.
 
     Returns:
-        FP32 router logits shaped ``[M, 896]``.
+        FP32 router logits shaped ``[M, E]``.
     """
     m, output_width, input_width = _validate_fallback_projection(
         hidden_states,
@@ -791,34 +805,47 @@ def kimi3_router_projection(
         name="Kimi K3 router projection",
         out_dtype=torch.float32,
     )
-    if solution not in {"auto", "cuda", "cublas", "triton_gemv", "torch"}:
+    if solution not in {
+        "auto",
+        "dsv3",
+        "cuda",
+        "cublas",
+        "triton_gemv",
+        "torch",
+    }:
         raise ValueError(f"unknown Kimi K3 router solution {solution!r}")
-    specialized = (
+    bf16_dense = (
         hidden_states.is_cuda
         and hidden_states.dtype == torch.bfloat16
         and weight.dtype == torch.bfloat16
         and hidden_states.is_contiguous()
         and weight.is_contiguous()
+    )
+    gfx950_shape = (
+        1 <= m <= _ROUTER_TRITON_MAX_TOKENS
         and input_width == KIMI3_HIDDEN_SIZE
         and output_width == KIMI3_ROUTER_SIZE
     )
+    dsv3_shape = input_width in {3072, 6144, KIMI3_HIDDEN_SIZE}
     if solution == "auto":
         platform = Platform.get()
-        if platform.is_cdna4 and specialized and m == 1:
+        if platform.is_cdna4 and bf16_dense and gfx950_shape:
             solution = "triton_gemv"
-        elif platform.is_hopper_plus and specialized:
+        elif platform.is_hopper_plus and bf16_dense and dsv3_shape:
             if m > _ROUTER_CUDA_MAX_TOKENS and _mm_out_dtype_supported():
                 solution = "cublas"
             else:
-                solution = "cuda"
+                solution = "dsv3"
         else:
             solution = "torch"
+    elif solution == "cuda":
+        # Backward-compatible alias for the implementation's actual name.
+        solution = "dsv3"
     if solution == "cublas":
-        if not specialized or not _mm_out_dtype_supported():
+        if not bf16_dense or not _mm_out_dtype_supported():
             raise ValueError(
-                "Kimi K3 router cublas path requires contiguous BF16 "
-                "[M, 7168] input, [896, 7168] weight, and torch.mm out_dtype "
-                "support (torch >= 2.8)"
+                "Kimi K3 router cublas path requires contiguous CUDA BF16 "
+                "inputs and torch.mm out_dtype support (torch >= 2.8)"
             )
         # cublasLt BF16xBF16 with FP32 accumulate AND FP32 store: same output
         # semantics as the CUDA kernel, flat ~7.3us across M on B300.
@@ -828,10 +855,10 @@ def kimi3_router_projection(
         out.copy_(logits)
         return out
     if solution == "triton_gemv":
-        if not specialized or m != 1:
+        if not (Platform.get().is_cdna4 and bf16_dense and gfx950_shape):
             raise ValueError(
-                "Kimi K3 router Triton GEMV requires contiguous gfx950 "
-                "BF16 [1, 7168] input and [896, 7168] weight"
+                "Kimi K3 Triton router requires contiguous gfx950 BF16 "
+                "[1..16, 7168] input and [896, 7168] weight"
             )
         if out is None:
             out = torch.empty(
@@ -839,18 +866,24 @@ def kimi3_router_projection(
                 dtype=torch.float32,
                 device=hidden_states.device,
             )
+        if m == 1:
+            config = (4, 1024, 4, 1)
+        elif m == 2:
+            config = (8, 256, 8, 1)
+        else:
+            config = (4, 512, 4, 0)
         return _triton_projection_gemv(
             hidden_states,
             weight,
             out=out,
-            config=((4, 1024, 4, 1) if m == 1 else (8, 256, 8, 1)),
+            config=config,
             validate=False,
         )
-    if solution == "cuda":
-        if not specialized:
+    if solution == "dsv3":
+        if not (Platform.get().is_hopper_plus and bf16_dense and dsv3_shape):
             raise ValueError(
-                "Kimi K3 router CUDA kernel requires contiguous BF16 "
-                "[M, 7168] input and [896, 7168] weight"
+                "Kimi K3 DSV3 router requires Hopper+ contiguous BF16 inputs "
+                "with hidden size 3072, 6144, or 7168"
             )
         from tokenspeed_kernel.ops.gemm.cuda import dsv3_router_gemm
 

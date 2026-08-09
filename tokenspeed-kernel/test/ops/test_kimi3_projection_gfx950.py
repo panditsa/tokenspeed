@@ -115,6 +115,7 @@ def test_kimi3_latent_projection_add3_matches_torch_and_captures(
     prefix = torch.randn(num_tokens, 7168, device="cuda", dtype=torch.bfloat16)
     lane = torch.randn(num_tokens, 10752, device="cuda", dtype=torch.bfloat16)
     shared_output = lane[:, 3584:]
+    output = torch.empty_like(prefix)
     expected = (
         prefix + torch.nn.functional.linear(hidden_states, weight) + shared_output
     )
@@ -126,7 +127,9 @@ def test_kimi3_latent_projection_add3_matches_torch_and_captures(
             weight,
             prefix,
             shared_output,
+            out=output,
         )
+    assert actual.data_ptr() == output.data_ptr()
     graph.replay()
     torch.cuda.synchronize()
 
@@ -169,7 +172,7 @@ def test_kimi3_rmsnorm_linear_add_matches_composed_and_captures() -> None:
 def test_kimi3_latent_projection_rejects_forced_kernel_for_non_k3_shape() -> None:
     hidden_states = torch.empty(1, 128, device="cuda", dtype=torch.bfloat16)
     weight = torch.empty(64, 128, device="cuda", dtype=torch.bfloat16)
-    with pytest.raises(ValueError, match="requires a contiguous gfx950"):
+    with pytest.raises(ValueError, match="requires a supported contiguous"):
         tokenspeed_kernel.kimi3_latent_projection(
             hidden_states,
             weight,
@@ -243,15 +246,20 @@ def test_kimi3_router_projection_matches_torch_and_captures() -> None:
     torch.testing.assert_close(actual_weights, expected_weights, rtol=1e-6, atol=1e-7)
 
 
-@pytest.mark.parametrize("num_tokens", [0, 1, 2, 4, 8, 33])
+@pytest.mark.parametrize("num_tokens", [0, 1, 2, 4, 8, 16, 33])
 def test_kimi3_router_projection_dispatches_all_token_counts(
     num_tokens: int,
 ) -> None:
+    torch.manual_seed(num_tokens)
     hidden_states = torch.randn(num_tokens, 7168, device="cuda", dtype=torch.bfloat16)
-    weight = torch.randn(896, 7168, device="cuda", dtype=torch.bfloat16)
+    weight = (torch.randn(896, 7168, device="cuda") * 0.01).to(torch.bfloat16)
+    correction_bias = torch.randn(896, device="cuda") * 0.01
     expected = torch.nn.functional.linear(hidden_states.float(), weight.float())
     actual = tokenspeed_kernel.kimi3_router_projection(hidden_states, weight)
     torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-4)
+    _, expected_ids = moe_sigmoid_bias_topk(expected, correction_bias, 16)
+    _, actual_ids = moe_sigmoid_bias_topk(actual, correction_bias, 16)
+    assert torch.equal(actual_ids, expected_ids)
 
 
 @pytest.mark.parametrize("linear_beta", [None, 2.5])
