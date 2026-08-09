@@ -39,6 +39,9 @@ if not _is_gfx950():
     pytest.skip("MXFP4 SiTU Gluon tests require gfx950", allow_module_level=True)
 
 import tokenspeed_kernel
+from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.a4w4_warp_decode import (
+    gluon_a4w4_situ_warp_decode_ep_gfx950,
+)
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused import (
     shuffle_weight_for_gluon_dot_layout,
 )
@@ -543,13 +546,19 @@ def test_mxfp4_situ_ep_paths_are_cuda_graph_capturable_gfx950(
     torch.testing.assert_close(captured, eager, atol=3e-2, rtol=3e-2)
 
 
-def test_a4w4_linear_weights_match_preshuffled_weights_gfx950() -> None:
+@pytest.mark.parametrize("num_tokens", [1, 8])
+def test_a4w4_linear_weights_match_preshuffled_weights_gfx950(
+    num_tokens: int,
+) -> None:
     generator = torch.Generator(device="cuda").manual_seed(20260807)
     raw = make_mxfp4_moe_weights(8, 1024, 512, generator)
     hidden = torch.randn(
-        (8, 1024), dtype=torch.bfloat16, device="cuda", generator=generator
+        (num_tokens, 1024),
+        dtype=torch.bfloat16,
+        device="cuda",
+        generator=generator,
     )
-    topk_weights, topk_ids = make_round_robin_topk(8, 8, 2)
+    topk_weights, topk_ids = make_round_robin_topk(num_tokens, 8, 2)
 
     def interleave(tensor: torch.Tensor) -> torch.Tensor:
         gate, up = tensor.chunk(2, dim=1)
@@ -581,3 +590,138 @@ def test_a4w4_linear_weights_match_preshuffled_weights_gfx950() -> None:
     )
 
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_a4w4_global_ep_routes_match_compact_local_routes_gfx950() -> None:
+    generator = torch.Generator(device="cuda").manual_seed(20260809)
+    raw = make_mxfp4_moe_weights(2, 1024, 512, generator)
+    hidden = torch.randn(
+        (1, 1024), dtype=torch.bfloat16, device="cuda", generator=generator
+    )
+    topk_ids = torch.arange(16, dtype=torch.int32, device="cuda").unsqueeze(0)
+    topk_weights = torch.softmax(
+        torch.randn((1, 16), dtype=torch.float32, device="cuda", generator=generator),
+        dim=-1,
+    )
+    expert_start = 6
+
+    actual = gluon_mxfp4_situ_moe_decode(
+        hidden,
+        raw["w13_weight"],
+        raw["w13_scale"],
+        raw["w2_weight"],
+        raw["w2_scale"],
+        topk_ids,
+        topk_weights,
+        expert_start=expert_start,
+        linear_weights=True,
+    )
+    expected = gluon_mxfp4_situ_moe_decode(
+        hidden,
+        raw["w13_weight"],
+        raw["w13_scale"],
+        raw["w2_weight"],
+        raw["w2_scale"],
+        topk_ids[:, expert_start : expert_start + 2],
+        topk_weights[:, expert_start : expert_start + 2],
+        expert_start=expert_start,
+        linear_weights=True,
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_a4w4_joint_shared_down_matches_composition_gfx950() -> None:
+    generator = torch.Generator(device="cuda").manual_seed(20260808)
+    raw = make_mxfp4_moe_weights(2, 3584, 3072, generator)
+    hidden = torch.randn(
+        (1, 3584), dtype=torch.bfloat16, device="cuda", generator=generator
+    )
+    topk_weights, topk_ids = make_round_robin_topk(1, 2, 2)
+    shared_input = torch.randn(
+        (1, 768), dtype=torch.bfloat16, device="cuda", generator=generator
+    )
+    shared_weight = torch.randn(
+        (7168, 768), dtype=torch.bfloat16, device="cuda", generator=generator
+    )
+
+    routed = gluon_mxfp4_situ_moe_decode(
+        hidden,
+        raw["w13_weight"],
+        raw["w13_scale"],
+        raw["w2_weight"],
+        raw["w2_scale"],
+        topk_ids,
+        topk_weights,
+        linear_weights=True,
+    )
+    expected_shared = torch.nn.functional.linear(
+        shared_input.float(), shared_weight.float()
+    ).to(torch.bfloat16)
+    routed_out = torch.empty_like(routed)
+    shared_out = torch.empty_like(expected_shared)
+    actual = gluon_mxfp4_situ_moe_decode(
+        hidden,
+        raw["w13_weight"],
+        raw["w13_scale"],
+        raw["w2_weight"],
+        raw["w2_scale"],
+        topk_ids,
+        topk_weights,
+        linear_weights=True,
+        shared_input=shared_input,
+        shared_weight=shared_weight,
+        routed_out=routed_out,
+        shared_out=shared_out,
+    )
+
+    assert isinstance(actual, tuple)
+    assert actual[0].data_ptr() == routed_out.data_ptr()
+    assert actual[1].data_ptr() == shared_out.data_ptr()
+    torch.testing.assert_close(actual[0], routed, atol=0, rtol=0)
+    torch.testing.assert_close(actual[1], expected_shared, atol=1e-2, rtol=1e-2)
+
+
+def test_a4w4_warp_decode_matches_mfma_and_captures_gfx950() -> None:
+    generator = torch.Generator(device="cuda").manual_seed(20260810)
+    raw = make_mxfp4_moe_weights(2, 1024, 512, generator)
+    hidden = torch.randn(
+        (1, 1024), dtype=torch.bfloat16, device="cuda", generator=generator
+    )
+    topk_ids = torch.arange(16, dtype=torch.int32, device="cuda").unsqueeze(0)
+    topk_weights = torch.softmax(
+        torch.randn((1, 16), dtype=torch.float32, device="cuda", generator=generator),
+        dim=-1,
+    )
+    expected = gluon_mxfp4_situ_moe_decode(
+        hidden,
+        raw["w13_weight"],
+        raw["w13_scale"],
+        raw["w2_weight"],
+        raw["w2_scale"],
+        topk_ids,
+        topk_weights,
+        linear_weights=True,
+    )
+
+    def apply() -> torch.Tensor:
+        return gluon_a4w4_situ_warp_decode_ep_gfx950(
+            hidden,
+            raw["w13_weight"],
+            raw["w13_scale"],
+            raw["w2_weight"],
+            raw["w2_scale"],
+            topk_weights,
+            topk_ids,
+            stage2_block_kb=256,
+        )
+
+    actual = apply()
+    torch.testing.assert_close(actual, expected, atol=3e-2, rtol=3e-2)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = apply()
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(captured, expected, atol=3e-2, rtol=3e-2)

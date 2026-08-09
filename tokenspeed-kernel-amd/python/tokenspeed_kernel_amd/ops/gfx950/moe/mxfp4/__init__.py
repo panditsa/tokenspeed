@@ -28,6 +28,9 @@ decode entry point, while ``routing.py`` exposes the fused dense
 top-k helpers used by decode and package prefill.
 """
 
+from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.a4w4_warp_decode import (
+    gluon_a4w4_situ_warp_decode_ep_gfx950,
+)
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.decode_stage1 import (
     invoke_stage1_mxfp4_mfma_decode_gluon,
 )
@@ -61,6 +64,7 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.scale import (
 __all__ = [
     "attach_prefill_aliases",
     "gather_package_cdna4_scale",
+    "gluon_a4w4_situ_warp_decode_ep_gfx950",
     "gluon_latent_expert_shared_decode_gfx950",
     "gluon_mxfp4_moe_decode",
     "gluon_mxfp4_situ_moe_decode",

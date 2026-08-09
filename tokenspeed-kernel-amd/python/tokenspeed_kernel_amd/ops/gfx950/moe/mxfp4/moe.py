@@ -138,7 +138,11 @@ def gluon_mxfp4_situ_moe_decode(
     expert_start: int = 0,
     linear_weights: bool = False,
     w13_interleaved: bool = False,
-) -> torch.Tensor:
+    shared_input: torch.Tensor | None = None,
+    shared_weight: torch.Tensor | None = None,
+    routed_out: torch.Tensor | None = None,
+    shared_out: torch.Tensor | None = None,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Run K3 A4W4 decode without a BF16 intermediate.
 
     W13 accumulates and applies SiTU in registers, then writes packed MXFP4
@@ -183,10 +187,12 @@ def gluon_mxfp4_situ_moe_decode(
         linear_weights=linear_weights,
         w13_interleaved=w13_interleaved,
     )
-    out = torch.empty(
-        (tokens, hidden), dtype=torch.bfloat16, device=hidden_states.device
+    out = (
+        torch.empty((tokens, hidden), dtype=torch.bfloat16, device=hidden_states.device)
+        if routed_out is None
+        else routed_out
     )
-    invoke_stage2_mxfp4_mfma_decode_gluon(
+    return invoke_stage2_mxfp4_mfma_decode_gluon(
         inter_mxfp4,
         inter_scale,
         w2,
@@ -196,10 +202,13 @@ def gluon_mxfp4_situ_moe_decode(
         out,
         topk,
         BLOCK_N=block_d2,
+        PIPELINE_K=tokens > 1,
         expert_start=expert_start,
         linear_weights=linear_weights,
+        shared_input=shared_input,
+        shared_weight=shared_weight,
+        shared_out=shared_out,
     )
-    return out
 
 
 __all__ = ["gluon_mxfp4_moe_decode", "gluon_mxfp4_situ_moe_decode"]

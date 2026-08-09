@@ -53,6 +53,8 @@ _ROUTE_GL_DTYPE = {
     torch.float32: gl.float32,
 }
 _LOG2E = gl.constexpr(1.4426950408889634)
+_KIMI3_SHARED_K = gl.constexpr(768)
+_KIMI3_SHARED_BLOCK_K = gl.constexpr(512)
 
 
 def _next_pow2(x: int) -> int:
@@ -1153,9 +1155,9 @@ def _stage1_mxfp4_direct_mfma_gluon(
     # load/wait/MFMA group per K tile; the constexpr bound lets the backend
     # overlap adjacent groups and cuts the 56-tile Kimi stage1 wait chain.
     TOTAL_KT: gl.constexpr = gl.cdiv(K_PACKED, BLOCK_K_PACKED)
-    acc = gl.zeros((M_DUP, BLOCK_N), dtype=gl.float32, layout=mfma_layout)
 
     if (token < M) & route_valid:
+        acc = gl.zeros((M_DUP, BLOCK_N), dtype=gl.float32, layout=mfma_layout)
         for kt in range(TOTAL_KT):
             a, b, a_scale, b_scale = _direct_mxfp4_load_tile(
                 kt,
@@ -1195,65 +1197,75 @@ def _stage1_mxfp4_direct_mfma_gluon(
             )
             acc = _direct_mxfp4_mfma(acc, a, b, a_scale, b_scale)
 
-    if USE_SITU:
-        out_tile = _direct_situ_reduce(acc, SITU_BETA, SITU_LINEAR_BETA, OUT_BLOCK_N)
-    else:
-        out_tile = _direct_swiglu_reduce(
-            acc,
-            SWIGLU_ALPHA,
-            SWIGLU_LIMIT,
-            SWIGLU_BETA,
-            OUT_BLOCK_N,
-        )
-    if QUANT_OUT:
-        packed, scale = quantize_mxfp4_tile(out_tile)
-        packed = packed.reshape((M_DUP, OUT_BLOCK_N // 2))
-        packed_m = gl.arange(0, M_DUP, layout=gl.SliceLayout(1, packed.type.layout))[
-            :, None
-        ]
-        packed_n = gl.arange(
-            0, OUT_BLOCK_N // 2, layout=gl.SliceLayout(0, packed.type.layout)
-        )[None, :]
-        gl.store(
-            out_ptr
-            + slot_flat.to(gl.int64) * stride_om
-            + (pid_n * (OUT_BLOCK_N // 2) + packed_n).to(gl.int64) * stride_on
-            + packed_m.to(gl.int64) * 0,
-            packed,
-            mask=(token < M) & route_valid & (packed_m == 0),
-        )
-        scale_m = gl.arange(0, M_DUP, layout=gl.SliceLayout(1, scale.type.layout))[
-            :, None
-        ]
-        scale_k = (
-            pid_n * (OUT_BLOCK_N // 32)
-            + gl.arange(
-                0, OUT_BLOCK_N // 32, layout=gl.SliceLayout(0, scale.type.layout)
+        if USE_SITU:
+            out_tile = _direct_situ_reduce(
+                acc, SITU_BETA, SITU_LINEAR_BETA, OUT_BLOCK_N
+            )
+        else:
+            out_tile = _direct_swiglu_reduce(
+                acc,
+                SWIGLU_ALPHA,
+                SWIGLU_LIMIT,
+                SWIGLU_BETA,
+                OUT_BLOCK_N,
+            )
+        if QUANT_OUT:
+            packed, scale = quantize_mxfp4_tile(out_tile)
+            packed = packed.reshape((M_DUP, OUT_BLOCK_N // 2))
+            packed_m = gl.arange(
+                0, M_DUP, layout=gl.SliceLayout(1, packed.type.layout)
+            )[:, None]
+            packed_n = gl.arange(
+                0,
+                OUT_BLOCK_N // 2,
+                layout=gl.SliceLayout(0, packed.type.layout),
             )[None, :]
-        )
-        store_cdna4_scale(
-            out_scale_ptr,
-            scale,
-            slot_flat + scale_m,
-            scale_k,
-            stride_oslin,
-            stride_osnb,
-            (token < M) & route_valid & (scale_m == 0),
-        )
-        return
-    sm = gl.arange(0, M_DUP, layout=gl.SliceLayout(1, out_tile.type.layout))[:, None]
-    sn = gl.arange(0, OUT_BLOCK_N, layout=gl.SliceLayout(0, out_tile.type.layout))[
-        None, :
-    ]
-    out_col = pid_n * OUT_BLOCK_N + sn
-    gl.store(
-        out_ptr
-        + slot_flat.to(gl.int64) * stride_om
-        + out_col.to(gl.int64) * stride_on
-        + sm.to(gl.int64) * 0,
-        out_tile.to(out_ptr.dtype.element_ty),
-        mask=(token < M) & route_valid & (sm == 0) & (out_col < (TWO_I // 2)),
-    )
+            gl.store(
+                out_ptr
+                + slot_flat.to(gl.int64) * stride_om
+                + (pid_n * (OUT_BLOCK_N // 2) + packed_n).to(gl.int64) * stride_on
+                + packed_m.to(gl.int64) * 0,
+                packed,
+                mask=packed_m == 0,
+            )
+            scale_m = gl.arange(0, M_DUP, layout=gl.SliceLayout(1, scale.type.layout))[
+                :, None
+            ]
+            scale_k = (
+                pid_n * (OUT_BLOCK_N // 32)
+                + gl.arange(
+                    0,
+                    OUT_BLOCK_N // 32,
+                    layout=gl.SliceLayout(0, scale.type.layout),
+                )[None, :]
+            )
+            store_cdna4_scale(
+                out_scale_ptr,
+                scale,
+                slot_flat + scale_m,
+                scale_k,
+                stride_oslin,
+                stride_osnb,
+                scale_m == 0,
+            )
+        else:
+            sm = gl.arange(0, M_DUP, layout=gl.SliceLayout(1, out_tile.type.layout))[
+                :, None
+            ]
+            sn = gl.arange(
+                0,
+                OUT_BLOCK_N,
+                layout=gl.SliceLayout(0, out_tile.type.layout),
+            )[None, :]
+            out_col = pid_n * OUT_BLOCK_N + sn
+            gl.store(
+                out_ptr
+                + slot_flat.to(gl.int64) * stride_om
+                + out_col.to(gl.int64) * stride_on
+                + sm.to(gl.int64) * 0,
+                out_tile.to(out_ptr.dtype.element_ty),
+                mask=(sm == 0) & (out_col < (TWO_I // 2)),
+            )
 
 
 def invoke_stage1_mxfp4_mfma_decode_gluon(
@@ -1450,6 +1462,9 @@ def _stage2_mxfp4_direct_mfma_gluon(
     topk_ids_ptr,  # (M, TOPK) int32
     topk_weights_ptr,  # (M, TOPK) float32
     out_ptr,  # (M, D) bf16
+    shared_input_ptr,
+    shared_weight_ptr,
+    shared_out_ptr,
     M,
     D,
     N_PHYS: gl.constexpr,
@@ -1481,6 +1496,8 @@ def _stage2_mxfp4_direct_mfma_gluon(
     EXPERT_START: gl.constexpr,
     NUM_LOCAL_EXPERTS: gl.constexpr,
     LINEAR_WEIGHTS: gl.constexpr,
+    FUSE_SHARED_DOWN: gl.constexpr,
+    NUM_ROUTED_PROGRAMS: gl.constexpr,
 ):
     BLOCK_K_PACKED: gl.constexpr = BLOCK_K // 2
     BLOCK_K_SCALE: gl.constexpr = BLOCK_K // 32
@@ -1494,6 +1511,51 @@ def _stage2_mxfp4_direct_mfma_gluon(
     )
 
     pid = gl.program_id(axis=0)
+    if FUSE_SHARED_DOWN and pid >= NUM_ROUTED_PROGRAMS:
+        shared_pid_n = pid - NUM_ROUTED_PROGRAMS
+        shared_layout: gl.constexpr = gl.BlockedLayout(
+            [1, _KIMI3_SHARED_BLOCK_K // _LANES],
+            [1, _LANES],
+            [1, 1],
+            [1, 0],
+        )
+        shared_n_layout: gl.constexpr = gl.SliceLayout(1, shared_layout)
+        shared_k_layout: gl.constexpr = gl.SliceLayout(0, shared_layout)
+        shared_offs_n = shared_pid_n * BLOCK_N + gl.arange(
+            0, BLOCK_N, layout=shared_n_layout
+        )
+        shared_acc = gl.zeros([BLOCK_N], gl.float32, shared_n_layout)
+        for k0 in range(0, _KIMI3_SHARED_K, _KIMI3_SHARED_BLOCK_K):
+            shared_offs_k = k0 + gl.arange(
+                0, _KIMI3_SHARED_BLOCK_K, layout=shared_k_layout
+            )
+            shared_k_valid = shared_offs_k < _KIMI3_SHARED_K
+            shared_input = gl.amd.cdna4.buffer_load(
+                ptr=shared_input_ptr,
+                offsets=shared_offs_k.to(gl.int32),
+                mask=shared_k_valid,
+                other=0.0,
+            ).to(gl.float32)
+            shared_weight = gl.amd.cdna4.buffer_load(
+                ptr=shared_weight_ptr,
+                offsets=(
+                    shared_offs_n[:, None].to(gl.int64) * _KIMI3_SHARED_K
+                    + shared_offs_k[None, :].to(gl.int64)
+                ).to(gl.int32),
+                mask=shared_k_valid[None, :],
+                other=0.0,
+            )
+            shared_input = gl.convert_layout(shared_input[None, :], shared_layout)
+            shared_acc += gl.sum(
+                shared_weight.to(gl.float32) * shared_input,
+                axis=1,
+            )
+        gl.store(
+            shared_out_ptr + shared_offs_n,
+            shared_acc.to(shared_out_ptr.dtype.element_ty),
+        )
+        return
+
     num_n = gl.cdiv(D, BLOCK_N)
     token = pid // num_n
     pid_n = pid % num_n
@@ -1667,9 +1729,10 @@ def _stage2_mxfp4_direct_mfma_gluon(
             # only then reduces top-k.  Keeping ``gate * acc`` in FP32 until
             # the final store changes thousands of Kimi decode elements by a
             # BF16 ULP even when routing, quantization, and stage 1 are exact.
-            partial = acc.to(out_ptr.dtype.element_ty)
-            routed_weight = gate.to(partial.dtype)
-            acc_total += (partial * routed_weight).to(gl.float32)
+            if route_valid:
+                partial = acc.to(out_ptr.dtype.element_ty)
+                routed_weight = gate.to(partial.dtype)
+                acc_total += (partial * routed_weight).to(gl.float32)
 
     sm = gl.arange(0, M_DUP, layout=gl.SliceLayout(1, mfma_layout))[:, None]
     sn = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, mfma_layout))[None, :]
@@ -1699,6 +1762,9 @@ def invoke_stage2_mxfp4_mfma_decode_gluon(
     PIPELINE_K: bool = True,
     expert_start: int = 0,
     linear_weights: bool = False,
+    shared_input: torch.Tensor | None = None,
+    shared_weight: torch.Tensor | None = None,
+    shared_out: torch.Tensor | None = None,
 ):
     assert inter_states_mxfp4.dtype == torch.uint8
     assert inter_scale.dtype == torch.uint8
@@ -1721,9 +1787,43 @@ def invoke_stage2_mxfp4_mfma_decode_gluon(
         assert int(getattr(w2, "gluon_dot_block_n", 0)) == 128
         assert w2_scale.stride(-2) == 1
     assert inter_scale.stride(-2) == 1
+    fuse_shared_down = shared_input is not None or shared_weight is not None
+    if fuse_shared_down:
+        if shared_input is None or shared_weight is None:
+            raise ValueError("shared input and weight must be provided together")
+        if (
+            tuple(shared_input.shape) != (1, 768)
+            or tuple(shared_weight.shape) != (7168, 768)
+            or shared_input.dtype != torch.bfloat16
+            or shared_weight.dtype != torch.bfloat16
+            or not shared_input.is_contiguous()
+            or not shared_weight.is_contiguous()
+            or shared_input.device != out.device
+            or shared_weight.device != out.device
+        ):
+            raise ValueError("shared down fusion requires contiguous BF16 K3 tensors")
+        if shared_out is None:
+            shared_out = torch.empty((1, 7168), dtype=torch.bfloat16, device=out.device)
+        if (
+            tuple(shared_out.shape) != (1, 7168)
+            or shared_out.dtype != torch.bfloat16
+            or not shared_out.is_contiguous()
+            or shared_out.device != out.device
+        ):
+            raise ValueError("shared output must be contiguous BF16 [1, 7168]")
+    elif shared_out is not None:
+        raise ValueError("shared output requires shared down fusion")
+    else:
+        shared_input = out
+        shared_weight = out
+        shared_out = out
     topk_ids = topk_ids.to(torch.int32)
     topk_weights = topk_weights.to(torch.float32)
-    grid = (num_tokens * triton.cdiv(D, BLOCK_N),)
+    routed_programs = num_tokens * triton.cdiv(D, BLOCK_N)
+    total_programs = routed_programs + (
+        triton.cdiv(7168, BLOCK_N) if fuse_shared_down else 0
+    )
+    grid = (total_programs,)
     _stage2_mxfp4_direct_mfma_gluon[grid](
         inter_states_mxfp4,
         inter_scale,
@@ -1732,6 +1832,9 @@ def invoke_stage2_mxfp4_mfma_decode_gluon(
         topk_ids,
         topk_weights,
         out,
+        shared_input,
+        shared_weight,
+        shared_out,
         num_tokens,
         D,
         N_phys,
@@ -1763,8 +1866,12 @@ def invoke_stage2_mxfp4_mfma_decode_gluon(
         EXPERT_START=int(expert_start),
         NUM_LOCAL_EXPERTS=int(w2.shape[0]),
         LINEAR_WEIGHTS=linear_weights,
+        FUSE_SHARED_DOWN=fuse_shared_down,
+        NUM_ROUTED_PROGRAMS=routed_programs,
         num_warps=1,
     )
+    if fuse_shared_down:
+        return out, shared_out
     return out
 
 
