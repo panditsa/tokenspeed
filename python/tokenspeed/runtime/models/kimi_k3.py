@@ -825,8 +825,6 @@ class KimiLinearKDA(nn.Module):
             )
         f_a_end = 4 * proj_local + self.head_dim
         mixed_qkv = output[:, : 3 * proj_local]
-        if not mixed_qkv.is_contiguous():
-            mixed_qkv = mixed_qkv.contiguous()
         return (
             mixed_qkv,
             output[:, 3 * proj_local : 4 * proj_local],
@@ -917,7 +915,7 @@ class KimiLinearKDA(nn.Module):
         # Per-head gated RMSNorm + sigmoid output gate in one kernel.
         core_out = rmsnorm_gated_sigmoid(
             core_out.reshape(num_tokens, hn * hd).contiguous(),
-            out_gate.contiguous(),
+            out_gate,
             self.o_norm.weight,
             self.o_norm.variance_epsilon,
             hn,
