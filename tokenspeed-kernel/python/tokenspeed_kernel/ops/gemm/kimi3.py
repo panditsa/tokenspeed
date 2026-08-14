@@ -416,8 +416,8 @@ def kimi3_latent_projection_add3(
             When provided, RMSNorm is applied to ``hidden_states`` before the
             projection.
         eps: Positive RMSNorm epsilon required with ``norm_weight``.
-        solution: ``"auto"`` selects the fused row-CTA GEMV for one-token
-            execution, the fused MFMA epilogue for the tuned M=16 tile, and
+        solution: ``"auto"`` selects the fused row-CTA GEMV for up to four
+            tokens, the fused MFMA epilogue for the tuned M=16 tile, and
             otherwise composes the registered projection and add kernels.
             ``"rowcta_gemv"``, ``"gluon_mfma_add3"``, and ``"composed"``
             force an implementation.
@@ -471,7 +471,7 @@ def kimi3_latent_projection_add3(
         if (
             solution == "auto"
             and Platform.get().is_cdna4
-            and m == 1
+            and m <= 4
             and (k, n) == (KIMI3_LATENT_SIZE, KIMI3_HIDDEN_SIZE)
             and specialized
         ):

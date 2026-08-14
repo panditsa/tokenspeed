@@ -1380,7 +1380,7 @@ class KimiLinearMoE(nn.Module):
         the up-projection's store performs the accumulate in-kernel.
         """
         if self.native_latent_moe is not None:
-            if self._use_fused_decode_pipeline and hidden_states.shape[0] == 1:
+            if self._use_fused_decode_pipeline and hidden_states.shape[0] <= 4:
                 return self._forward_fused_decode_pipeline(hidden_states, prefix_sum)
             return self.native_latent_moe(
                 hidden_states,
