@@ -12,8 +12,13 @@
 from __future__ import annotations
 
 import torch
+
 from tokenspeed_kernel.ops.attention.kda_utils import KdaPrefillResult
-from tokenspeed_kernel.platform import CapabilityRequirement
+from tokenspeed_kernel.platform import (
+    ArchVersion,
+    CapabilityRequirement,
+    current_platform,
+)
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
@@ -25,6 +30,21 @@ _DENSE_HALF_SIGNATURES = format_signatures(
 @register_kernel(
     "attention",
     "kda_fused_paged_decode",
+    name="triton_amd_kda_fused_paged_decode_gfx950",
+    solution="triton",
+    capability=CapabilityRequirement(
+        min_arch_version=ArchVersion(9, 5),
+        max_arch_version=ArchVersion(9, 5),
+        vendors=frozenset({"amd"}),
+    ),
+    signatures=_DENSE_HALF_SIGNATURES,
+    priority=Priority.SPECIALIZED,
+    traits={"paged_state": frozenset({True})},
+    tags={"amd", "gfx950", "paged_cache", "cuda_graph", "fusion"},
+)
+@register_kernel(
+    "attention",
+    "kda_fused_paged_decode",
     name="triton_nvidia_kda_fused_paged_decode",
     solution="triton",
     capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
@@ -33,7 +53,7 @@ _DENSE_HALF_SIGNATURES = format_signatures(
     traits={"paged_state": frozenset({True})},
     tags={"nvidia", "paged_cache", "cuda_graph", "fusion"},
 )
-def triton_nvidia_kda_fused_paged_decode(
+def triton_kda_fused_paged_decode(
     mixed_qkv: torch.Tensor,
     conv_weights: torch.Tensor,
     conv_states: torch.Tensor,
@@ -50,10 +70,23 @@ def triton_nvidia_kda_fused_paged_decode(
     head_dim: int,
     cu_seqlens: torch.Tensor,
     lower_bound: float | None,
-) -> torch.Tensor:
-    """Adapt dev's NVIDIA conv/GEMV/recurrent megafusion."""
+) -> torch.Tensor | None:
+    """Adapt the conv/GEMV/recurrent megafusion for supported GPUs."""
+    if current_platform().is_amd and mixed_qkv.shape[0] > 8:
+        return None
+
     from tokenspeed_kernel.thirdparty.triton.fla_kda_recurrent import (
         fused_recurrent_kda_megafuse,
+    )
+
+    tokens = mixed_qkv.shape[0]
+    amd_tuning = (
+        {
+            "block_value": 16 if tokens <= 2 else 32,
+            "num_warps": 2 if tokens <= 4 else 1,
+        }
+        if current_platform().is_amd
+        else {}
     )
 
     return fused_recurrent_kda_megafuse(
@@ -72,6 +105,7 @@ def triton_nvidia_kda_fused_paged_decode(
         head_dim=head_dim,
         cu_seqlens=cu_seqlens,
         lower_bound=lower_bound,
+        **amd_tuning,
     ).view(1, -1, num_heads, head_dim)
 
 

@@ -1005,6 +1005,8 @@ def fused_recurrent_kda_megafuse(
     scale: float | None = None,
     cu_seqlens: torch.Tensor | None = None,
     lower_bound: float | None = None,
+    block_value: int = 32,
+    num_warps: int = 4,
 ) -> torch.Tensor:
     """Single-step KDA decode with conv1d(+silu) and the f_b gate GEMV fused in.
 
@@ -1030,7 +1032,7 @@ def fused_recurrent_kda_megafuse(
     assert qkv_raw.stride(-1) == 1 and conv_w.is_contiguous() and w_fb.is_contiguous()
     N = T if cu_seqlens is None else len(cu_seqlens) - 1
     out = torch.empty(T, HV, V, dtype=qkv_raw.dtype, device=qkv_raw.device)
-    BV = 32
+    BV = block_value
     grid = (triton.cdiv(V, BV) * N * HV,)
     fused_recurrent_kda_megafuse_fwd_kernel[grid](
         qkv_raw=qkv_raw,
@@ -1063,7 +1065,7 @@ def fused_recurrent_kda_megafuse(
         BV=BV,
         stride_state_page=h_pool.stride(0),
         stride_conv_page=conv_pool.stride(0),
-        num_warps=4,
+        num_warps=num_warps,
         num_stages=2,
     )
     return out

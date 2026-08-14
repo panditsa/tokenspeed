@@ -10,6 +10,7 @@ from tokenspeed_kernel.ops.attention import (
     _attention_format_signature,
     kda_paged_decode,
     kda_paged_prefill,
+    try_kda_fused_paged_decode,
 )
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
@@ -284,3 +285,136 @@ def test_kda_paged_decode_does_not_select_nvidia_kernel_on_amd() -> None:
             _attention_format_signature(q=q, k=k, v=v),
             traits={"indexed_state": True, "single_token": False},
         )
+
+
+def test_k3_fused_paged_decode_matches_composed_path_on_gfx950() -> None:
+    """The small-batch megafuse preserves K3 state and graph semantics."""
+    if not current_platform().is_cdna4:
+        pytest.skip("gfx950 KDA fusion test")
+
+    from tokenspeed.runtime.layers.attention.linear.causal_conv1d import (
+        causal_conv1d_update,
+    )
+
+    torch.manual_seed(29)
+    batch, heads, head_dim = 4, 12, 128
+    projection = heads * head_dim
+    packed = (
+        torch.randn(
+            batch,
+            3 * projection + head_dim + heads,
+            device="cuda",
+        )
+        * 0.1
+    ).to(torch.bfloat16)
+    mixed_qkv = packed[:, : 3 * projection]
+    f_a = packed[:, 3 * projection : 3 * projection + head_dim]
+    beta = packed[:, 3 * projection + head_dim :]
+    conv_weight = (
+        torch.randn(3 * projection, 4, device="cuda") * 0.1
+    ).to(torch.bfloat16)
+    conv_seed = (
+        torch.randn(2 * batch + 1, 3 * projection, 3, device="cuda") * 0.1
+    ).to(torch.bfloat16)
+    f_b_weight = (
+        torch.randn(projection, head_dim, device="cuda") * 0.1
+    ).to(torch.bfloat16)
+    state_seed = (
+        torch.randn(
+            2 * batch + 1,
+            heads,
+            head_dim,
+            head_dim,
+            device="cuda",
+        )
+        * 0.01
+    )
+    a_log = torch.randn(heads, device="cuda") * 0.1
+    dt_bias = torch.randn(projection, device="cuda") * 0.1
+    read_indices = torch.arange(1, batch + 1, device="cuda", dtype=torch.int32)
+    write_indices = read_indices + batch
+    cu_seqlens = torch.arange(batch + 1, device="cuda", dtype=torch.int32)
+
+    expected_conv = conv_seed.clone()
+    expected_state = state_seed.clone()
+    mixed = causal_conv1d_update(
+        mixed_qkv.clone(),
+        expected_conv,
+        conv_weight,
+        None,
+        "silu",
+        conv_state_indices=read_indices,
+        output_state_indices=write_indices.view(-1, 1),
+    )
+    q, k, v = mixed.split(projection, dim=-1)
+    gate = torch.nn.functional.linear(f_a, f_b_weight)
+    expected = kda_paged_decode(
+        q.view(1, batch, heads, head_dim),
+        k.view(1, batch, heads, head_dim),
+        v.view(1, batch, heads, head_dim),
+        gate.view(1, batch, heads, head_dim),
+        beta.view(1, batch, heads),
+        a_log,
+        dt_bias,
+        state_pool=expected_state,
+        read_indices=read_indices,
+        write_indices=write_indices,
+        cu_seqlens=cu_seqlens,
+        lower_bound=-5.0,
+    )
+
+    actual_conv = conv_seed.clone()
+    actual_state = state_seed.clone()
+
+    def fused() -> torch.Tensor:
+        result = try_kda_fused_paged_decode(
+            mixed_qkv,
+            conv_weight,
+            actual_conv,
+            f_a,
+            f_b_weight,
+            beta,
+            a_log,
+            dt_bias,
+            state_pool=actual_state,
+            read_indices=read_indices,
+            write_indices=write_indices,
+            num_heads=heads,
+            head_dim=head_dim,
+            cu_seqlens=cu_seqlens,
+            lower_bound=-5.0,
+        )
+        assert result is not None
+        return result
+
+    actual = fused()
+    torch.testing.assert_close(actual, expected, atol=2e-3, rtol=2e-3)
+    torch.testing.assert_close(actual_conv, expected_conv, atol=0, rtol=0)
+    torch.testing.assert_close(actual_state, expected_state, atol=2e-2, rtol=2e-3)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        fused()
+    graph.replay()
+    torch.cuda.synchronize()
+
+    assert (
+        try_kda_fused_paged_decode(
+            mixed_qkv.repeat(4, 1),
+            conv_weight,
+            actual_conv,
+            f_a,
+            f_b_weight,
+            beta,
+            a_log,
+            dt_bias,
+            state_pool=actual_state,
+            read_indices=read_indices,
+            write_indices=write_indices,
+            num_heads=heads,
+            head_dim=head_dim,
+            cu_seqlens=cu_seqlens,
+            lower_bound=-5.0,
+        )
+        is None
+    )
