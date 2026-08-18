@@ -491,7 +491,20 @@ def kimi3_latent_projection_add3(
         if (
             solution == "auto"
             and Platform.get().is_cdna4
-            and m <= 4
+            and 3 <= m <= 16
+            and (k, n) == (KIMI3_LATENT_SIZE, KIMI3_HIDDEN_SIZE)
+            and specialized
+        ):
+            from tokenspeed_kernel.ops.activation.triton import add3
+            from tokenspeed_kernel.ops.layernorm.triton import rmsnorm
+
+            normalized = rmsnorm(hidden_states, norm_weight, eps)
+            projected = torch.nn.functional.linear(normalized, weight)
+            return add3(prefix, projected, shared_output)
+        if (
+            solution == "auto"
+            and Platform.get().is_cdna4
+            and m <= 2
             and (k, n) == (KIMI3_LATENT_SIZE, KIMI3_HIDDEN_SIZE)
             and specialized
         ):
