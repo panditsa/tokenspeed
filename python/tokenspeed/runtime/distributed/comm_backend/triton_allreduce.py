@@ -20,8 +20,15 @@
 
 """Triton all-reduce backend for latency-sensitive small AMD tensors."""
 
+import os
+from contextlib import ExitStack, contextmanager
+
 import torch
 import torch.distributed as dist
+from tokenspeed.runtime.distributed.comm_backend.base import CommBackend, Group
+from tokenspeed.runtime.distributed.process_group_manager import (
+    process_group_manager as pg_manager,
+)
 from tokenspeed_kernel.ops.communication.triton import (
     acquire_symm_outputs,
     all_reduce,
@@ -32,11 +39,6 @@ from tokenspeed_kernel.ops.communication.triton import (
     symm_outputs_can_run,
 )
 from tokenspeed_kernel.platform import current_platform
-
-from tokenspeed.runtime.distributed.comm_backend.base import CommBackend, Group
-from tokenspeed.runtime.distributed.process_group_manager import (
-    process_group_manager as pg_manager,
-)
 
 # Preserve the measured ordinary-Iris window while allowing a larger
 # producer-direct backing allocation.
@@ -52,6 +54,12 @@ class TritonAllReduceBackend(CommBackend):
     ):
         self._fallback = fallback
         self._instances = {}
+        self._aiter_instances = {}
+        self._aiter_inputs = {}
+        self._aiter_outputs = {}
+        aiter_control = os.environ.get("TOKENSPEED_AITER_AR_CONTROL", "")
+        self._use_aiter_control = aiter_control in ("1", "joint", "all")
+        self._use_aiter_for_all = aiter_control == "all"
         self._producer_direct_max_bytes = producer_direct_max_bytes
         self._max_numel = (
             min(producer_direct_max_bytes, _DEFAULT_ALL_REDUCE_MAX_BYTES)
@@ -75,6 +83,62 @@ class TritonAllReduceBackend(CommBackend):
         )
         self._instances[group] = state
         return state
+
+    def _ensure_aiter_communicator(self, group: Group):
+        if group in self._aiter_instances:
+            return self._aiter_instances[group]
+        from aiter.dist.device_communicators.custom_all_reduce import CustomAllreduce
+
+        state = self._instances[group]
+        communicator = CustomAllreduce(
+            group=pg_manager.get_process_group("gloo", group),
+            device=state.device,
+            max_size=self._producer_direct_max_bytes,
+        )
+        if communicator.disabled:
+            raise RuntimeError("AITER all-reduce control is unavailable")
+        self._aiter_instances[group] = communicator
+        return communicator
+
+    def _ensure_aiter_control(self, group: Group, dtype: torch.dtype) -> None:
+        if group in self._aiter_inputs:
+            return
+        import tokenspeed_kernel.ops.communication.iris as iris
+
+        state = self._instances[group]
+        iris_state = iris.IRIS_AR_STATES[(id(state.group), state.max_bytes, dtype)]
+        communicator = self._ensure_aiter_communicator(group)
+        communicator.register_input_buffer(iris_state._input_buf)
+        self._aiter_inputs[group] = iris_state._input_buf
+        self._aiter_outputs[group] = torch.empty_like(iris_state._input_buf)
+
+    def _aiter_all_reduce_outputs(
+        self,
+        tensors: tuple[torch.Tensor, ...],
+        group: Group,
+    ) -> tuple[torch.Tensor, ...]:
+        total_numel = sum(tensor.numel() for tensor in tensors)
+        packed_input = self._aiter_inputs[group][:total_numel]
+        packed_output = self._aiter_outputs[group][:total_numel]
+        self._aiter_instances[group].all_reduce(
+            packed_input,
+            out=packed_output,
+            registered_input=True,
+        )
+        offset = 0
+        outputs = []
+        for tensor in tensors:
+            end = offset + tensor.numel()
+            outputs.append(packed_output[offset:end].view_as(tensor))
+            offset = end
+        return tuple(outputs)
+
+    @contextmanager
+    def aiter_capture(self):
+        with ExitStack() as stack:
+            for communicator in self._aiter_instances.values():
+                stack.enter_context(communicator.capture())
+            yield
 
     def can_run(self, tensor: torch.Tensor, group: Group, op=None) -> bool:
         if len(group) <= 1 or not current_platform().is_amd:
@@ -102,11 +166,15 @@ class TritonAllReduceBackend(CommBackend):
     ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         if not isinstance(tensor, torch.Tensor):
             if self.can_reduce_outputs(tensor, group, op=op):
+                if self._use_aiter_control:
+                    return self._aiter_all_reduce_outputs(tensor, group)
                 return all_reduce_symmetric(self._instances[group], tensor)
             return super().all_reduce(tensor, group, op=op)
 
         state = self._get_or_create(group)
         if all_reduce_can_run(state, tensor, op=op):
+            if self._use_aiter_for_all:
+                return self._ensure_aiter_communicator(group).custom_all_reduce(tensor)
             return all_reduce(state, tensor, op=op)
         return self._fallback.all_reduce(tensor, group, op=op)
 
@@ -123,7 +191,10 @@ class TritonAllReduceBackend(CommBackend):
 
         # Do not let one rank silently select a different collective protocol.
         state = self._get_or_create(group)
-        return acquire_symm_outputs(state, shapes, like.dtype)
+        outputs = acquire_symm_outputs(state, shapes, like.dtype)
+        if self._use_aiter_control:
+            self._ensure_aiter_control(group, like.dtype)
+        return outputs
 
     def can_acquire_outputs(
         self,

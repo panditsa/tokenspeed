@@ -24,7 +24,7 @@ import bisect
 import gc
 import queue
 from collections.abc import Callable
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from typing import TYPE_CHECKING
 
 import torch
@@ -515,7 +515,18 @@ class CudaGraphWrapper:
         global _is_capture_mode
         _is_capture_mode = True
         global global_graph_memory_pool
-        with torch.cuda.graph(graph, pool=global_graph_memory_pool, stream=self.stream):
+        from tokenspeed.runtime.distributed.comm_backend import get_global_backend
+
+        backend = get_global_backend()
+        triton_ar = getattr(backend, "_triton_ar", None)
+        ar_ctx = (
+            triton_ar.aiter_capture()
+            if triton_ar is not None and triton_ar._use_aiter_for_all
+            else nullcontext()
+        )
+        with ar_ctx, torch.cuda.graph(
+            graph, pool=global_graph_memory_pool, stream=self.stream
+        ):
             out = run_once()
 
         torch.cuda.synchronize()
