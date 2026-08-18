@@ -57,6 +57,9 @@ InputProjector = Callable[
     [torch.Tensor, torch.Tensor | None],
     tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None,
 ]
+# Joint decode uses the same packed projection but returns the activated shared
+# input so the selected expert kernel can own the shared down projection.
+JointInputProjector = InputProjector
 _SUPPORTED_EP_SIZES = {1, 2, 4, 8}
 
 
@@ -239,12 +242,7 @@ class Kimi3MoEExecutionPlan:
                 and alt_stream is not None
                 and mapping.moe.tp_ep_size == 1
             ),
-            joint_moe_reduce=(
-                use_native
-                and mapping.moe.tp_size == 1
-                and mapping.moe.ep_size > 1
-                and mapping.moe.ep_group == mapping.moe.tp_ep_group
-            ),
+            joint_moe_reduce=use_native and mapping.moe.tp_ep_size > 1,
         )
 
     def prepare_latent_fusion(
@@ -335,6 +333,44 @@ class Kimi3LatentProjection(ReplicatedLinear):
             eps=eps,
         )
 
+    def forward_shard_add(
+        self,
+        hidden_states: torch.Tensor,
+        shared_output: torch.Tensor,
+        shard_start: int,
+        shard_size: int,
+        *,
+        norm_weight: torch.Tensor | None = None,
+        eps: float | None = None,
+    ) -> torch.Tensor:
+        """Project one output shard and accumulate it into the shared partial."""
+
+        weight = self.weight.narrow(0, shard_start, shard_size)
+        output = shared_output.narrow(-1, shard_start, shard_size)
+        if norm_weight is not None and current_platform().is_cdna4:
+            from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.rmsnorm_linear_add import (
+                gluon_rmsnorm_linear_add_gfx950,
+            )
+
+            return gluon_rmsnorm_linear_add_gfx950(
+                hidden_states,
+                norm_weight,
+                weight,
+                None,
+                output,
+                eps=eps,
+                out=output,
+            )
+        if norm_weight is not None:
+            source = hidden_states.float()
+            hidden_states = (
+                source
+                * torch.rsqrt(source.square().mean(dim=-1, keepdim=True) + eps)
+                * norm_weight.float()
+            ).to(hidden_states.dtype)
+        output.addmm_(hidden_states, weight.T)
+        return output
+
 
 def _module_tensor_output(module: nn.Module, x: torch.Tensor) -> torch.Tensor:
     """Return the tensor output of Torch or TokenSpeed linear-like modules."""
@@ -378,12 +414,28 @@ class LatentMoELayer(nn.Module):
         joint_reduce: bool = False,
         shared_expert_stream: torch.cuda.Stream | None = None,
         expert_parallel_group: tuple[int, ...] | None = None,
+        joint_reduce_group: tuple[int, ...] | None = None,
+        routed_output_shard: tuple[int, int] | None = None,
+        sharded_output_min_tokens: int = 1,
         return_separate_outputs: bool = False,
         input_projections: InputProjector | None = None,
+        joint_input_projections: JointInputProjector | None = None,
+        joint_shared_weight: torch.Tensor | None = None,
+        joint_expert_shared_max_tokens: int = 0,
     ) -> None:
         super().__init__()
         if input_projections is not None and shared_experts is None:
             raise ValueError("input_projections requires shared_experts")
+        if (joint_input_projections is None) != (joint_shared_weight is None):
+            raise ValueError(
+                "joint input projections and shared weight must be provided together"
+            )
+        if joint_input_projections is not None and not joint_reduce:
+            raise ValueError("joint expert/shared projection requires joint_reduce")
+        if joint_input_projections is not None and joint_expert_shared_max_tokens <= 0:
+            raise ValueError("joint expert/shared projection requires a token limit")
+        if joint_input_projections is None and joint_expert_shared_max_tokens:
+            raise ValueError("joint expert/shared token limit requires projections")
         if shared_reduce is not None and shared_experts is None:
             raise ValueError("shared_reduce requires shared_experts")
         if joint_reduce and shared_experts is None:
@@ -410,8 +462,12 @@ class LatentMoELayer(nn.Module):
                     "expert_parallel_group size must match experts.ep_size: "
                     f"{len(expert_parallel_group)} != {expert_parallel_size}"
                 )
-        if joint_reduce and expert_parallel_group is None:
-            raise ValueError("joint_reduce requires expert_parallel_group")
+        if joint_reduce_group is not None:
+            joint_reduce_group = tuple(joint_reduce_group)
+        if joint_reduce and joint_reduce_group is None:
+            joint_reduce_group = expert_parallel_group
+        if joint_reduce and joint_reduce_group is None:
+            raise ValueError("joint_reduce requires a reduction group")
         if expert_parallel_size > 1 and latent_reduce is None and not joint_reduce:
             if expert_parallel_group is None:
                 raise ValueError(
@@ -430,9 +486,15 @@ class LatentMoELayer(nn.Module):
         self.shared_reduce = shared_reduce
         self.joint_reduce = joint_reduce
         self.expert_parallel_group = expert_parallel_group
+        self.joint_reduce_group = joint_reduce_group
+        self.routed_output_shard = routed_output_shard
+        self.sharded_output_min_tokens = sharded_output_min_tokens
         self.stream_fork = StreamFork(shared_expert_stream)
         self.return_separate_outputs = return_separate_outputs
         self.input_projections = input_projections
+        self.joint_input_projections = joint_input_projections
+        self.joint_shared_weight = joint_shared_weight
+        self.joint_expert_shared_max_tokens = joint_expert_shared_max_tokens
 
     def finalize_output(
         self,
@@ -490,13 +552,18 @@ class LatentMoELayer(nn.Module):
         )
 
         output_shape = (num_tokens, hidden_size)
+        use_sharded_output = (
+            self.routed_output_shard is not None
+            and prefix_sum is not None
+            and num_tokens >= self.sharded_output_min_tokens
+        )
         reduction_outputs = (
             acquire_all_reduce_outputs(
                 (output_shape, (num_tokens, int(self.experts.hidden_size))),
                 hidden_states,
-                self.expert_parallel_group,
+                self.joint_reduce_group,
             )
-            if self.joint_reduce and num_tokens > 0
+            if self.joint_reduce and not use_sharded_output and num_tokens > 0
             else None
         )
         shared_target, routed_target = (
@@ -518,7 +585,20 @@ class LatentMoELayer(nn.Module):
         # shared branch against the routed one by construction, so it is only
         # worth taking when the branches were not going to overlap anyway.
         packed = None
-        if self.input_projections is not None and not overlap_shared and num_tokens > 0:
+        fuse_expert_shared = (
+            self.joint_input_projections is not None
+            and not overlap_shared
+            and 0 < num_tokens <= self.joint_expert_shared_max_tokens
+        )
+        if fuse_expert_shared:
+            packed = self.joint_input_projections(hidden_states, shared_target)
+            fuse_expert_shared = packed is not None
+        if (
+            packed is None
+            and self.input_projections is not None
+            and not overlap_shared
+            and num_tokens > 0
+        ):
             packed = self.input_projections(hidden_states, shared_target)
         packed_router, packed_routed, packed_shared = (
             (None, None, None) if packed is None else packed
@@ -527,6 +607,8 @@ class LatentMoELayer(nn.Module):
         def run_shared_branch() -> None:
             nonlocal shared_output, shared_reduction_applied
             if self.shared_experts is None:
+                return
+            if fuse_expert_shared:
                 return
             # This helper is entered through ``fork.branch()`` below.  With
             # overlap enabled, the full-width H->FFN->H shared-expert MLP runs
@@ -593,15 +675,33 @@ class LatentMoELayer(nn.Module):
             if routed_target is not None:
                 self.experts._situ_output_buffer = routed_target
             try:
-                routed_latent = self.experts(
+                expert_kwargs = (
+                    {
+                        "shared_input": packed_shared,
+                        "shared_weight": self.joint_shared_weight,
+                        "shared_out": shared_target,
+                    }
+                    if fuse_expert_shared
+                    else {}
+                )
+                expert_result = self.experts(
                     hidden_states=routed_input,
                     topk_output=topk_output,
                     num_global_tokens=num_global_tokens,
                     max_num_tokens_per_gpu=max_num_tokens_per_gpu,
+                    **expert_kwargs,
                 )
             finally:
                 if routed_target is not None:
                     self.experts._situ_output_buffer = previous_output
+            if fuse_expert_shared:
+                if not isinstance(expert_result, tuple):
+                    raise RuntimeError(
+                        "joint expert/shared kernel did not return both outputs"
+                    )
+                routed_latent, shared_output = expert_result
+            else:
+                routed_latent = expert_result
             _check_shape(routed_latent, latent_shape, "routed experts")
 
         # Spin-wait collectives cannot safely overlap an all-device GEMM.
@@ -616,11 +716,14 @@ class LatentMoELayer(nn.Module):
         if reduction_outputs is not None:
             shared_output, routed_latent = all_reduce(
                 reduction_outputs,
-                self.expert_parallel_group,
+                self.joint_reduce_group,
             )
             _check_shape(shared_output, output_shape, "joint shared output")
             _check_shape(routed_latent, latent_shape, "joint routed latent")
             shared_reduction_applied = True
+        elif use_sharded_output:
+            routed_latent = all_reduce(routed_latent, self.joint_reduce_group)
+            _check_shape(routed_latent, latent_shape, "latent_reduce")
         elif self.latent_reduce is not None:
             routed_latent = self.latent_reduce(routed_latent)
             _check_shape(routed_latent, latent_shape, "latent_reduce")
@@ -631,6 +734,27 @@ class LatentMoELayer(nn.Module):
             routed_output = _module_tensor_output(self.routed_up_proj, routed_latent)
             _check_shape(routed_output, output_shape, "routed_up_proj")
             return routed_output
+        if use_sharded_output:
+            shard_start, shard_size = self.routed_output_shard
+            norm_weight = (
+                None if self.routed_norm is None else self.routed_norm.weight
+            )
+            eps = (
+                None
+                if self.routed_norm is None
+                else self.routed_norm.variance_epsilon
+            )
+            self.routed_up_proj.forward_shard_add(
+                routed_latent,
+                shared_output,
+                shard_start,
+                shard_size,
+                norm_weight=norm_weight,
+                eps=eps,
+            )
+            shared_output = all_reduce(shared_output, self.joint_reduce_group)
+            _check_shape(shared_output, output_shape, "sharded output reduce")
+            return prefix_sum + shared_output
         if prefix_sum is None:
             if self.routed_norm is not None:
                 routed_latent = _module_tensor_output(self.routed_norm, routed_latent)

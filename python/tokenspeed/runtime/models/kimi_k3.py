@@ -957,6 +957,7 @@ class KimiLinearMoEGate(nn.Module):
 # this is a prefill chunk and takes the unsplit path; the scratch buffers are
 # allocated to exactly this many rows. Raise together with --max-num-seqs.
 ATTNRES_FAST_PATH_MAX_TOKENS = 32
+JOINT_EXPERT_SHARED_MAX_TOKENS = 4
 # Paired MI350 measurements show that stream scheduling costs more than the
 # available attention/AttnRes overlap through M=16. Preserve NVIDIA's policy.
 ATTNRES_STREAM_FORK_THRESHOLD = 16 if current_platform().is_amd else 0
@@ -1192,6 +1193,10 @@ class KimiLinearMoE(nn.Module):
             activation_situ_linear_beta=situ_linear_beta,
         )
         self.packed_input_projection_weight: torch.Tensor | None = None
+        joint_expert_shared = (
+            self.experts.plan.get("apply_kernel_name")
+            == "gluon_mxfp4_a8w4_situ_precomputed_moe_apply"
+        )
         self.native_latent_moe = (
             LatentMoELayer(
                 router=self.gate,
@@ -1204,14 +1209,48 @@ class KimiLinearMoE(nn.Module):
                 shared_reduce=(
                     None
                     if self.execution_plan.joint_moe_reduce
-                    else self._reduce_shared
+                    else self._reduce_moe_partial
+                ),
+                # MoE TP shards W13/W2 along the intermediate dimension, so
+                # each rank's W2 result is only a routed-latent partial.
+                latent_reduce=(
+                    self._reduce_moe_partial
+                    if mapping.moe.tp_size > 1
+                    and not self.execution_plan.joint_moe_reduce
+                    else None
                 ),
                 joint_reduce=self.execution_plan.joint_moe_reduce,
                 shared_expert_stream=(
                     alt_stream if self.execution_plan.overlap_shared_experts else None
                 ),
                 expert_parallel_group=mapping.moe.ep_group,
+                joint_reduce_group=mapping.moe.tp_ep_group,
+                routed_output_shard=(
+                    (
+                        mapping.moe.tp_rank
+                        * (config.hidden_size // mapping.moe.tp_size),
+                        config.hidden_size // mapping.moe.tp_size,
+                    )
+                    if current_platform().is_cdna4
+                    and mapping.moe.tp_size == 8
+                    and mapping.moe.ep_size == 1
+                    else None
+                ),
+                sharded_output_min_tokens=8,
                 input_projections=self._latent_input_projections,
+                joint_input_projections=(
+                    self._latent_input_activations if joint_expert_shared else None
+                ),
+                joint_shared_weight=(
+                    self.shared_experts.down_proj.weight
+                    if joint_expert_shared
+                    else None
+                ),
+                joint_expert_shared_max_tokens=(
+                    JOINT_EXPERT_SHARED_MAX_TOKENS
+                    if joint_expert_shared
+                    else 0
+                ),
             )
             if self.execution_plan.use_native
             else None
@@ -1262,19 +1301,16 @@ class KimiLinearMoE(nn.Module):
             )
             offset += rows
 
-    def _latent_input_projections(
+    def _latent_input_activations(
         self,
         hidden_states: torch.Tensor,
-        shared_out: torch.Tensor | None = None,
+        _shared_out: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
-        """Project the router, routed latent, and shared partial in one pass.
+        """Project the router, routed latent, and activated shared input."""
 
-        Returns ``None`` before the projection weights are concatenated, which
-        leaves the caller on the separate per-module projections.
-        """
         if self.packed_input_projection_weight is None:
             return None
-        router_logits, routed_input, shared_input = latent_moe_input_projections(
+        return latent_moe_input_projections(
             hidden_states,
             self.gate.weight,
             self.routed_expert_down_proj.weight,
@@ -1282,6 +1318,18 @@ class KimiLinearMoE(nn.Module):
             gate_clamp=self.shared_experts.act_fn.beta,
             up_clamp=self.shared_experts.act_fn.linear_beta,
         )
+
+    def _latent_input_projections(
+        self,
+        hidden_states: torch.Tensor,
+        shared_out: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        """Project the router, routed latent, and shared partial in one pass."""
+
+        projected = self._latent_input_activations(hidden_states)
+        if projected is None:
+            return None
+        router_logits, routed_input, shared_input = projected
         # The shared experts hold reduce_results=False, so this partial is
         # reduced by the layer's shared or joint reducer, not here.
         shared_output = kimi3_shared_down_projection(
@@ -1449,7 +1497,7 @@ class KimiLinearMoE(nn.Module):
                 shared_out,
             ).view(num_tokens, hidden_size)
         else:
-            shared_out = self._reduce_shared(shared_partial)
+            shared_out = self._reduce_moe_partial(shared_partial)
         # routed_scaling_factor already applied in TopK; not re-applied here
         # (matches the reference).
         return add3(
@@ -1458,11 +1506,11 @@ class KimiLinearMoE(nn.Module):
             shared_out.view(num_tokens, hidden_size),
         )
 
-    def _reduce_shared(self, shared_partial: torch.Tensor) -> torch.Tensor:
-        """Reduce the shared experts' TP partial on the current (default) stream."""
+    def _reduce_moe_partial(self, partial: torch.Tensor) -> torch.Tensor:
+        """Reduce a tensor-sharded MoE partial on the current stream."""
         if self.mapping.moe.tp_ep_size > 1:
-            return all_reduce(shared_partial, self.mapping.moe.tp_ep_group)
-        return shared_partial
+            return all_reduce(partial, self.mapping.moe.tp_ep_group)
+        return partial
 
 
 class KimiLinearDecoderLayer(nn.Module):
@@ -1670,7 +1718,7 @@ class KimiLinearDecoderLayer(nn.Module):
             )
             if residual_out is not None:
                 return residual_out, None
-        if combine is not None and prefix_sum is not None and num_tokens == 1:
+        if combine is not None and prefix_sum is not None and num_tokens > 0:
             scratch, _, _, out_norm_w, eps = combine
             if out_norm_w is not None:
                 from tokenspeed_kernel.ops.communication.triton import (
@@ -1801,7 +1849,7 @@ class KimiLinearDecoderLayer(nn.Module):
             else None
         )
         attnres_partial_args = None
-        if next_mix is not None and self._hoist_next_mlp and num_tokens == 1:
+        if next_mix is not None and self._hoist_next_mlp:
             next_layer, _ = next_mix
             # This layer's attention projection writes both block partials
             # hoisted for the next layer, which consumes their scratch slots.
@@ -1820,11 +1868,14 @@ class KimiLinearDecoderLayer(nn.Module):
             and ar_combine is not None
             and prefix_sum is not None
             and (
-                num_tokens == 1
-                or (
+                (
                     self._attn_ar_residual_fusion
                     and num_tokens
                     <= global_server_args_dict["comm_fusion_max_num_tokens"]
+                )
+                or (
+                    current_platform().is_cdna4
+                    and num_tokens <= ATTNRES_STREAM_FORK_THRESHOLD
                 )
             )
         )

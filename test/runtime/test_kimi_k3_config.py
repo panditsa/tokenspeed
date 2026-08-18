@@ -319,7 +319,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
         )
         self.assertTrue(mixed_qkv.is_contiguous())
 
-    def test_ep_kimi_moe_combines_shared_and_routed_reductions(self):
+    def test_kimi_moe_reduces_sharded_shared_and_routed_outputs(self):
         import tokenspeed.runtime.models.kimi_k3 as kimi_k3
 
         shared_calls = []
@@ -339,7 +339,15 @@ class KimiK3RegistrationTests(unittest.TestCase):
                 self.w13_weight_scale = torch.empty(0)
                 self.w2_weight = torch.empty(0)
                 self.w2_weight_scale = torch.empty(0)
-                self.plan = {}
+                self.plan = (
+                    {
+                        "apply_kernel_name": (
+                            "gluon_mxfp4_a8w4_situ_precomputed_moe_apply"
+                        )
+                    }
+                    if kwargs["tp_size"] == 8 and kwargs["ep_size"] == 1
+                    else {}
+                )
 
         class FakeSharedExperts(torch.nn.Module):
             def __init__(self, *args, **kwargs):
@@ -354,7 +362,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
                 self.components = kwargs
 
         ep_group = tuple(range(8))
-        mapping = SimpleNamespace(
+        ep_mapping = SimpleNamespace(
             moe=SimpleNamespace(
                 tp_rank=0,
                 tp_size=1,
@@ -365,6 +373,20 @@ class KimiK3RegistrationTests(unittest.TestCase):
                 tp_ep_size=8,
                 tp_ep_rank=0,
                 tp_ep_group=ep_group,
+            )
+        )
+        tp_group = tuple(range(8))
+        tp_mapping = SimpleNamespace(
+            moe=SimpleNamespace(
+                tp_rank=0,
+                tp_size=8,
+                tp_group=tp_group,
+                ep_rank=0,
+                ep_size=1,
+                ep_group=(0,),
+                tp_ep_size=8,
+                tp_ep_rank=0,
+                tp_ep_group=tp_group,
             )
         )
         config = KimiLinearConfig(
@@ -387,13 +409,26 @@ class KimiK3RegistrationTests(unittest.TestCase):
             mock.patch.object(kimi_k3, "KimiLinearMLP", FakeSharedExperts),
             mock.patch.object(kimi_k3, "LatentMoELayer", FakeLatentMoE),
             mock.patch.object(
+                kimi_k3,
+                "current_platform",
+                return_value=SimpleNamespace(is_cdna4=True),
+            ),
+            mock.patch.object(
                 kimi_k3.Kimi3MoEExecutionPlan,
                 "build",
-                return_value=kimi_k3.Kimi3MoEExecutionPlan(
-                    use_native=True,
-                    use_trtllm=False,
-                    overlap_shared_experts=False,
-                    joint_moe_reduce=True,
+                side_effect=(
+                    kimi_k3.Kimi3MoEExecutionPlan(
+                        use_native=True,
+                        use_trtllm=False,
+                        overlap_shared_experts=False,
+                        joint_moe_reduce=True,
+                    ),
+                    kimi_k3.Kimi3MoEExecutionPlan(
+                        use_native=True,
+                        use_trtllm=False,
+                        overlap_shared_experts=False,
+                        joint_moe_reduce=True,
+                    ),
                 ),
             ),
             mock.patch.dict(
@@ -401,9 +436,16 @@ class KimiK3RegistrationTests(unittest.TestCase):
                 {"enforce_eager": False},
             ),
         ):
-            layer = kimi_k3.KimiLinearMoE(
+            ep_layer = kimi_k3.KimiLinearMoE(
                 config,
-                mapping,
+                ep_mapping,
+                quant_config=None,
+                layer_index=1,
+                prefix="model.layers.1.block_sparse_moe",
+            )
+            tp_layer = kimi_k3.KimiLinearMoE(
+                config,
+                tp_mapping,
                 quant_config=None,
                 layer_index=1,
                 prefix="model.layers.1.block_sparse_moe",
@@ -411,9 +453,42 @@ class KimiK3RegistrationTests(unittest.TestCase):
 
         self.assertFalse(shared_calls[0]["reduce_results"])
         self.assertEqual(expert_calls[0]["internal_activation_dtype_override"], "input")
-        self.assertTrue(layer.native_latent_moe.components["joint_reduce"])
+        self.assertTrue(ep_layer.native_latent_moe.components["joint_reduce"])
         self.assertEqual(
-            layer.native_latent_moe.components["expert_parallel_group"], ep_group
+            ep_layer.native_latent_moe.components["expert_parallel_group"], ep_group
+        )
+        self.assertEqual(
+            ep_layer.native_latent_moe.components["joint_reduce_group"], ep_group
+        )
+        self.assertIsNone(ep_layer.native_latent_moe.components["latent_reduce"])
+        self.assertIsNone(
+            ep_layer.native_latent_moe.components["routed_output_shard"]
+        )
+        self.assertTrue(tp_layer.native_latent_moe.components["joint_reduce"])
+        self.assertEqual(
+            tp_layer.native_latent_moe.components["joint_reduce_group"], tp_group
+        )
+        self.assertIsNone(tp_layer.native_latent_moe.components["latent_reduce"])
+        self.assertEqual(
+            tp_layer.native_latent_moe.components["routed_output_shard"], (0, 8)
+        )
+        self.assertEqual(
+            tp_layer.native_latent_moe.components[
+                "joint_expert_shared_max_tokens"
+            ],
+            kimi_k3.JOINT_EXPERT_SHARED_MAX_TOKENS,
+        )
+        self.assertIsNotNone(
+            tp_layer.native_latent_moe.components["joint_input_projections"]
+        )
+        self.assertEqual(
+            ep_layer.native_latent_moe.components[
+                "joint_expert_shared_max_tokens"
+            ],
+            0,
+        )
+        self.assertIsNone(
+            ep_layer.native_latent_moe.components["joint_input_projections"]
         )
 
     def test_mla_gate_projection_uses_api_selected_layout(self):
