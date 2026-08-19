@@ -39,6 +39,7 @@ boundary, and combines all local routes directly into the rank's output.
 from __future__ import annotations
 
 import torch
+
 from tokenspeed_kernel_amd._triton import gl, gluon, triton
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.decode_common import (
     _cdna4_swizzled_mxfp4_scale_offset,
@@ -55,6 +56,12 @@ WARP_DECODE_STAGE2_BATCHED_BLOCK_N = 4
 WARP_DECODE_STAGE2_BLOCK_KB = 512
 WARP_DECODE_STAGE2_NUM_WARPS = 8
 WARP_DECODE_STAGE2_BATCHED_NUM_WARPS = 4
+WARP_DECODE_TP_STAGE1_BLOCK_N = 2
+WARP_DECODE_TP_STAGE1_NUM_WARPS = 1
+WARP_DECODE_TP_STAGE2_BLOCK_N = 8
+WARP_DECODE_TP_STAGE2_BLOCK_KB = 256
+WARP_DECODE_TP_STAGE2_NUM_WARPS = 1
+WARP_DECODE_TP_TOPK_PER_CTA = 1
 _MIN_WARP_DECODE_BLOCK_KB = 128
 _KIMI3_SHARED_K = gl.constexpr(768)
 _KIMI3_SHARED_BLOCK_K = gl.constexpr(512)
@@ -75,6 +82,8 @@ def _stage1_a16w4_situ_warp_gemv(
     w13_ptr,
     w13_scale_ptr,
     inter_ptr,
+    x_scale_ptr,
+    inter_scale_ptr,
     local_ids_ptr,
     hidden_dim,
     intermediate_dim,
@@ -97,6 +106,7 @@ def _stage1_a16w4_situ_warp_gemv(
     EXPERT_START: gl.constexpr,
     NUM_LOCAL_EXPERTS: gl.constexpr,
     LINEAR_WEIGHTS: gl.constexpr,
+    FP8_ACTIVATIONS: gl.constexpr,
     W13_INTERLEAVED: gl.constexpr,
     NUM_PID_N: gl.constexpr,
     BLOCK_N: gl.constexpr,
@@ -178,20 +188,10 @@ def _stage1_a16w4_situ_warp_gemv(
             + offs_kb[None, :].to(gl.int64) * stride_wk
             + gate_col[:, None].to(gl.int64) * stride_wn
         )
-        up_w_offsets = (
-            w_expert
-            + offs_kb[None, :].to(gl.int64) * stride_wk
-            + up_col[:, None].to(gl.int64) * stride_wn
-        )
         if LINEAR_WEIGHTS:
             gate_scale_offsets = (
                 scale_expert
                 + expanded_gate_col[:, None].to(gl.int64) * stride_slin
-                + (expanded_k[None, :] // 32).to(gl.int64) * stride_snb
-            )
-            up_scale_offsets = (
-                scale_expert
-                + expanded_up_col[:, None].to(gl.int64) * stride_slin
                 + (expanded_k[None, :] // 32).to(gl.int64) * stride_snb
             )
         else:
@@ -202,22 +202,9 @@ def _stage1_a16w4_situ_warp_gemv(
                 stride_slin,
                 stride_snb,
             )
-            up_scale_offsets = _cdna4_swizzled_mxfp4_scale_offset(
-                scale_expert,
-                expanded_up_col[:, None],
-                expanded_k[None, :] // 32,
-                stride_slin,
-                stride_snb,
-            )
         gate_packed = gl.amd.cdna4.buffer_load(
             ptr=w13_ptr,
             offsets=gate_w_offsets.to(gl.int32),
-            mask=packed_k_valid[None, :],
-            other=0,
-        )
-        up_packed = gl.amd.cdna4.buffer_load(
-            ptr=w13_ptr,
-            offsets=up_w_offsets.to(gl.int32),
             mask=packed_k_valid[None, :],
             other=0,
         )
@@ -232,6 +219,34 @@ def _stage1_a16w4_situ_warp_gemv(
             gl.bfloat16,
             axis=1,
         )
+        x_tile = gl.convert_layout(x[None, :], expanded_layout)
+        gate_acc += gl.sum(gate_w.to(gl.float32) * x_tile, axis=1)
+
+        up_w_offsets = (
+            w_expert
+            + offs_kb[None, :].to(gl.int64) * stride_wk
+            + up_col[:, None].to(gl.int64) * stride_wn
+        )
+        if LINEAR_WEIGHTS:
+            up_scale_offsets = (
+                scale_expert
+                + expanded_up_col[:, None].to(gl.int64) * stride_slin
+                + (expanded_k[None, :] // 32).to(gl.int64) * stride_snb
+            )
+        else:
+            up_scale_offsets = _cdna4_swizzled_mxfp4_scale_offset(
+                scale_expert,
+                expanded_up_col[:, None],
+                expanded_k[None, :] // 32,
+                stride_slin,
+                stride_snb,
+            )
+        up_packed = gl.amd.cdna4.buffer_load(
+            ptr=w13_ptr,
+            offsets=up_w_offsets.to(gl.int32),
+            mask=packed_k_valid[None, :],
+            other=0,
+        )
         up_w = gl.amd.cdna4.scaled_upcast(
             up_packed,
             gl.amd.cdna4.buffer_load(
@@ -243,13 +258,16 @@ def _stage1_a16w4_situ_warp_gemv(
             gl.bfloat16,
             axis=1,
         )
-        x_tile = gl.convert_layout(x[None, :], expanded_layout)
-        gate_acc += gl.sum(gate_w.to(gl.float32) * x_tile, axis=1)
         up_acc += gl.sum(up_w.to(gl.float32) * x_tile, axis=1)
 
-    # Match Kimi's BF16 W13 output before evaluating SiTU in FP32.
-    gate = gate_acc.to(gl.bfloat16).to(gl.float32)
-    up = up_acc.to(gl.bfloat16).to(gl.float32)
+    if FP8_ACTIVATIONS:
+        x_scale = gl.load(x_scale_ptr).to(gl.float32)
+        gate = gate_acc * x_scale
+        up = up_acc * x_scale
+    else:
+        # Match Kimi's BF16 W13 output before evaluating SiTU in FP32.
+        gate = gate_acc.to(gl.bfloat16).to(gl.float32)
+        up = up_acc.to(gl.bfloat16).to(gl.float32)
     gate = (
         SITU_BETA
         * gl.extra.libdevice.tanh(gate / SITU_BETA)
@@ -257,7 +275,10 @@ def _stage1_a16w4_situ_warp_gemv(
     )
     if HAS_LINEAR_BETA:
         up = SITU_LINEAR_BETA * gl.extra.libdevice.tanh(up / SITU_LINEAR_BETA)
-    activated = (gate * up).to(inter_ptr.dtype.element_ty)
+    activated = gate * up
+    if FP8_ACTIVATIONS:
+        activated *= 1.0 / gl.load(inter_scale_ptr).to(gl.float32)
+    activated = activated.to(inter_ptr.dtype.element_ty)
     gl.store(
         inter_ptr + route.to(gl.int64) * stride_im + expanded_offs_n * stride_in,
         activated,
@@ -270,6 +291,7 @@ def _stage2_a16w4_warp_gemv_combine(
     w2_ptr,
     w2_scale_ptr,
     out_ptr,
+    inter_scale_ptr,
     local_ids_ptr,
     topk_weights_ptr,
     shared_input_ptr,
@@ -301,7 +323,9 @@ def _stage2_a16w4_warp_gemv_combine(
     EXPERT_START: gl.constexpr,
     NUM_LOCAL_EXPERTS: gl.constexpr,
     LINEAR_WEIGHTS: gl.constexpr,
+    FP8_ACTIVATIONS: gl.constexpr,
     NUM_PID_N: gl.constexpr,
+    NUM_TOPK_GROUPS: gl.constexpr,
     NUM_SHARED_PID_N: gl.constexpr,
     BLOCK_N: gl.constexpr,
     BLOCK_KB: gl.constexpr,
@@ -332,9 +356,9 @@ def _stage2_a16w4_warp_gemv_combine(
             shared_k_valid = shared_offs_k < _KIMI3_SHARED_K
             shared_input = gl.amd.cdna4.buffer_load(
                 ptr=shared_input_ptr,
-                offsets=(
-                    shared_token * stride_sim + shared_offs_k * stride_sik
-                ).to(gl.int32),
+                offsets=(shared_token * stride_sim + shared_offs_k * stride_sik).to(
+                    gl.int32
+                ),
                 mask=shared_k_valid,
                 other=0.0,
             ).to(gl.float32)
@@ -356,15 +380,15 @@ def _stage2_a16w4_warp_gemv_combine(
                 axis=1,
             )
         gl.store(
-            shared_out_ptr
-            + shared_token * stride_som
-            + shared_offs_n * stride_son,
+            shared_out_ptr + shared_token * stride_som + shared_offs_n * stride_son,
             shared_acc.to(shared_out_ptr.dtype.element_ty),
         )
         return
 
-    token = pid // NUM_PID_N
-    pid_n = pid % NUM_PID_N
+    token = pid // (NUM_TOPK_GROUPS * NUM_PID_N)
+    token_pid = pid % (NUM_TOPK_GROUPS * NUM_PID_N)
+    topk_group = token_pid // NUM_PID_N
+    pid_n = token_pid % NUM_PID_N
     layout: gl.constexpr = gl.BlockedLayout(
         [(BLOCK_N + NUM_WARPS - 1) // NUM_WARPS, BLOCK_KB // _LANES],
         [1, _LANES],
@@ -386,7 +410,12 @@ def _stage2_a16w4_warp_gemv_combine(
     packed_k = intermediate_dim // 2
     acc = gl.zeros([BLOCK_N], gl.float32, expanded_n_layout)
 
-    for slot in gl.static_range(0, TOP_K):
+    for group_slot in gl.static_range(
+        0, (TOP_K + NUM_TOPK_GROUPS - 1) // NUM_TOPK_GROUPS
+    ):
+        slot = (
+            topk_group * ((TOP_K + NUM_TOPK_GROUPS - 1) // NUM_TOPK_GROUPS) + group_slot
+        )
         expert = (
             gl.load(local_ids_ptr + token * stride_idm + slot * stride_ids)
             - EXPERT_START
@@ -408,9 +437,7 @@ def _stage2_a16w4_warp_gemv_combine(
                     packed_k_valid = offs_kb < packed_k
                     expanded_k_valid = expanded_k < intermediate_dim
                 else:
-                    packed_k_valid = gl.full(
-                        [BLOCK_KB], True, gl.int1, layout=k_layout
-                    )
+                    packed_k_valid = gl.full([BLOCK_KB], True, gl.int1, layout=k_layout)
                     expanded_k_valid = gl.full(
                         [2 * BLOCK_KB], True, gl.int1, layout=expanded_k_layout
                     )
@@ -458,12 +485,50 @@ def _stage2_a16w4_warp_gemv_combine(
                 )
                 inter_tile = gl.convert_layout(inter[None, :], expanded_layout)
                 route_acc += gl.sum(weight.to(gl.float32) * inter_tile, axis=1)
-            # Match the reference's BF16 W2 result before route weighting.
-            acc += route_weight * route_acc.to(gl.bfloat16).to(gl.float32)
+            if FP8_ACTIVATIONS:
+                acc += route_weight * (
+                    route_acc * gl.load(inter_scale_ptr).to(gl.float32)
+                )
+            else:
+                # Match the reference's BF16 W2 result before route weighting.
+                acc += route_weight * route_acc.to(gl.bfloat16).to(gl.float32)
 
+    out_row = token * NUM_TOPK_GROUPS + topk_group
     gl.store(
-        out_ptr + token * stride_om + expanded_offs_n * stride_on,
+        out_ptr + out_row * stride_om + expanded_offs_n * stride_on,
         acc.to(out_ptr.dtype.element_ty),
+    )
+
+
+@gluon.jit
+def _reduce_topk_groups(
+    partial_ptr,
+    out_ptr,
+    hidden_dim,
+    stride_pm,
+    stride_pn,
+    stride_om,
+    stride_on,
+    NUM_GROUPS: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+):
+    pid = gl.program_id(0)
+    num_pid_n = gl.cdiv(hidden_dim, BLOCK_N)
+    token = pid // num_pid_n
+    pid_n = pid % num_pid_n
+    layout: gl.constexpr = gl.BlockedLayout([4], [64], [1], [0])
+    offs_n = pid_n * BLOCK_N + gl.arange(0, BLOCK_N, layout=layout)
+    acc = gl.zeros([BLOCK_N], gl.float32, layout=layout)
+    for group in gl.static_range(0, NUM_GROUPS):
+        acc += gl.load(
+            partial_ptr + (token * NUM_GROUPS + group) * stride_pm + offs_n * stride_pn,
+            mask=offs_n < hidden_dim,
+            other=0.0,
+        ).to(gl.float32)
+    gl.store(
+        out_ptr + token * stride_om + offs_n * stride_on,
+        acc.to(out_ptr.dtype.element_ty),
+        mask=offs_n < hidden_dim,
     )
 
 
@@ -485,6 +550,7 @@ def gluon_a16w4_situ_warp_decode_ep_gfx950(
     shared_weight: torch.Tensor | None = None,
     routed_out: torch.Tensor | None = None,
     shared_out: torch.Tensor | None = None,
+    _fp8_activations: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Compute a tiny-M EP contribution from packed MXFP4 weights.
 
@@ -606,14 +672,37 @@ def gluon_a16w4_situ_warp_decode_ep_gfx950(
         )
 
     local_topk_ids = local_topk_ids.to(torch.int32)
+    if _fp8_activations:
+        if situ_linear_beta is None:
+            raise ValueError("A8W4 SiTU decode requires a linear beta")
+        from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused import (
+            _dynamic_fp8_quantize,
+            _situ_intermediate_scale,
+        )
+
+        stage1_input, input_scale = _dynamic_fp8_quantize(hidden_states)
+        inter_scale = _situ_intermediate_scale(
+            hidden_states.device, float(situ_beta * situ_linear_beta)
+        )
+        inter_dtype = torch.float8_e4m3fn
+    else:
+        stage1_input = hidden_states
+        input_scale = hidden_states
+        inter_scale = hidden_states
+        inter_dtype = torch.bfloat16
     inter = torch.empty(
         (num_tokens * top_k, intermediate_dim),
-        dtype=torch.bfloat16,
+        dtype=inter_dtype,
         device=hidden_states.device,
     )
-    stage1_block_n = WARP_DECODE_STAGE1_BLOCK_N
+    tp_local = num_experts == 896 and intermediate_dim == 384 and top_k == 16
+    stage1_block_n = (
+        WARP_DECODE_TP_STAGE1_BLOCK_N if tp_local else WARP_DECODE_STAGE1_BLOCK_N
+    )
     stage1_block_kb = WARP_DECODE_STAGE1_BLOCK_KB
-    stage1_warps = WARP_DECODE_STAGE1_NUM_WARPS
+    stage1_warps = (
+        WARP_DECODE_TP_STAGE1_NUM_WARPS if tp_local else WARP_DECODE_STAGE1_NUM_WARPS
+    )
     if (
         intermediate_dim % stage1_block_n
         or stage1_block_kb < _MIN_WARP_DECODE_BLOCK_KB
@@ -624,16 +713,18 @@ def gluon_a16w4_situ_warp_decode_ep_gfx950(
         )
     stage1_grid = num_tokens * top_k * triton.cdiv(intermediate_dim, stage1_block_n)
     _stage1_a16w4_situ_warp_gemv[(stage1_grid,)](
-        hidden_states,
+        stage1_input,
         w13_weight,
         w13_scale,
         inter,
+        input_scale,
+        inter_scale,
         local_topk_ids,
         hidden_dim,
         intermediate_dim,
         top_k,
-        hidden_states.stride(0),
-        hidden_states.stride(1),
+        stage1_input.stride(0),
+        stage1_input.stride(1),
         w13_weight.stride(0),
         w13_stride_k,
         w13_stride_n,
@@ -650,6 +741,7 @@ def gluon_a16w4_situ_warp_decode_ep_gfx950(
         EXPERT_START=int(expert_start),
         NUM_LOCAL_EXPERTS=num_experts,
         LINEAR_WEIGHTS=linear_weights,
+        FP8_ACTIVATIONS=_fp8_activations,
         W13_INTERLEAVED=(w13_interleaved if linear_weights else True),
         NUM_PID_N=intermediate_dim // stage1_block_n,
         BLOCK_N=stage1_block_n,
@@ -666,24 +758,44 @@ def gluon_a16w4_situ_warp_decode_ep_gfx950(
         raise ValueError("routed output must be contiguous and colocated")
     # Finer output tiles keep work balanced when local route counts differ.
     stage2_block_n = (
-        WARP_DECODE_STAGE2_BATCHED_BLOCK_N
-        if num_tokens in (2, 4)
-        else WARP_DECODE_STAGE2_BLOCK_N
+        WARP_DECODE_TP_STAGE2_BLOCK_N
+        if tp_local
+        else (
+            WARP_DECODE_STAGE2_BATCHED_BLOCK_N
+            if num_tokens in (2, 4)
+            else WARP_DECODE_STAGE2_BLOCK_N
+        )
     )
     packed_intermediate = intermediate_dim // 2
-    stage2_block_kb = _largest_exact_block_kb(
-        packed_intermediate,
-        WARP_DECODE_STAGE2_BLOCK_KB,
+    stage2_block_kb = (
+        WARP_DECODE_TP_STAGE2_BLOCK_KB
+        if tp_local
+        else _largest_exact_block_kb(
+            packed_intermediate,
+            WARP_DECODE_STAGE2_BLOCK_KB,
+        )
     )
     # The M=1 joint path remains faster with eight waves.
     stage2_warps = (
-        WARP_DECODE_STAGE2_BATCHED_NUM_WARPS
-        if num_tokens in (2, 4)
-        else WARP_DECODE_STAGE2_NUM_WARPS
+        WARP_DECODE_TP_STAGE2_NUM_WARPS
+        if tp_local
+        else (
+            WARP_DECODE_STAGE2_BATCHED_NUM_WARPS
+            if num_tokens in (2, 4)
+            else WARP_DECODE_STAGE2_NUM_WARPS
+        )
     )
     if hidden_dim % stage2_block_n:
         raise ValueError("stage2 requires exact output-column tiles")
-    stage2_grid = num_tokens * triton.cdiv(hidden_dim, stage2_block_n)
+    num_topk_groups = triton.cdiv(top_k, WARP_DECODE_TP_TOPK_PER_CTA) if tp_local else 1
+    stage2_grid = num_tokens * num_topk_groups * triton.cdiv(hidden_dim, stage2_block_n)
+    stage2_out = out
+    if num_topk_groups > 1:
+        stage2_out = torch.empty(
+            (num_tokens * num_topk_groups, hidden_dim),
+            dtype=torch.bfloat16 if _fp8_activations else torch.float32,
+            device=hidden_states.device,
+        )
     if fuse_shared_down:
         if shared_out is None:
             shared_out = torch.empty(
@@ -709,7 +821,8 @@ def gluon_a16w4_situ_warp_decode_ep_gfx950(
         inter,
         w2_weight,
         w2_scale,
-        out,
+        stage2_out,
+        inter_scale,
         local_topk_ids,
         topk_weights,
         out if shared_input is None else shared_input,
@@ -725,8 +838,8 @@ def gluon_a16w4_situ_warp_decode_ep_gfx950(
         w2_scale.stride(0),
         w2_scale.stride(1),
         w2_scale.stride(2),
-        out.stride(0),
-        out.stride(1),
+        stage2_out.stride(0),
+        stage2_out.stride(1),
         local_topk_ids.stride(0),
         local_topk_ids.stride(1),
         topk_weights.stride(0),
@@ -741,7 +854,9 @@ def gluon_a16w4_situ_warp_decode_ep_gfx950(
         EXPERT_START=int(expert_start),
         NUM_LOCAL_EXPERTS=num_experts,
         LINEAR_WEIGHTS=linear_weights,
+        FP8_ACTIVATIONS=_fp8_activations,
         NUM_PID_N=hidden_dim // stage2_block_n,
+        NUM_TOPK_GROUPS=num_topk_groups,
         NUM_SHARED_PID_N=7168 // stage2_block_n,
         BLOCK_N=stage2_block_n,
         BLOCK_KB=stage2_block_kb,
@@ -749,9 +864,33 @@ def gluon_a16w4_situ_warp_decode_ep_gfx950(
         MASK_K_TAIL=packed_intermediate % stage2_block_kb != 0,
         num_warps=stage2_warps,
     )
+    if num_topk_groups > 1:
+        _reduce_topk_groups[(num_tokens * triton.cdiv(hidden_dim, 256),)](
+            stage2_out,
+            out,
+            hidden_dim,
+            stage2_out.stride(0),
+            stage2_out.stride(1),
+            out.stride(0),
+            out.stride(1),
+            NUM_GROUPS=num_topk_groups,
+            BLOCK_N=256,
+            num_warps=1,
+        )
     if fuse_shared_down:
         return out, shared_out
     return out
 
 
-__all__ = ["gluon_a16w4_situ_warp_decode_ep_gfx950"]
+def gluon_a8w4_situ_warp_decode_ep_gfx950(*args, **kwargs):
+    """Run the route-direct GEMV with dynamically quantized FP8 activations."""
+
+    return gluon_a16w4_situ_warp_decode_ep_gfx950(
+        *args, **kwargs, _fp8_activations=True
+    )
+
+
+__all__ = [
+    "gluon_a8w4_situ_warp_decode_ep_gfx950",
+    "gluon_a16w4_situ_warp_decode_ep_gfx950",
+]
