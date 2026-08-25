@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import torch
+
 from tokenspeed_kernel.ops.attention.kda_utils import KdaPrefillResult
 from tokenspeed_kernel.platform import (
     ArchVersion,
@@ -364,7 +365,9 @@ if current_platform().is_amd:
         """Run the decay projection and V-major gfx950 fused decode."""
         if output_gate is None or norm_weight is None or norm_eps is None:
             raise ValueError("gfx950 fused KDA decode requires output normalization")
-        raw_g = torch.nn.functional.linear(f_a_out, f_b_weight)
+        from tokenspeed_kernel.ops.gemm import mm
+
+        raw_g = mm(f_a_out, f_b_weight)
         return _kda_fused_decode_impl(
             mixed_qkv=mixed_qkv,
             conv_weights=conv_weights,
@@ -866,8 +869,8 @@ if current_platform().is_amd:
         ),
         priority=Priority.SPECIALIZED,
         traits={
-            "batch_size": frozenset({1}),
-            "num_heads": frozenset({12, 16}),
+            "batch_size": frozenset({1, 28, 32}),
+            "num_heads": frozenset({8, 12, 16}),
             "latent_dim": frozenset({512}),
             "value_dim": frozenset({128}),
             "gate_kind": frozenset({"none", "sigmoid"}),

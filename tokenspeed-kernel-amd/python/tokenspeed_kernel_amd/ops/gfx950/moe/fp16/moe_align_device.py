@@ -28,16 +28,15 @@ the prefill path (large M), where the fused single-CTA align does not scale
 Gluon backend.
 
 Kernels:
-  1. ``_init_kernel``   -- parallel fill of the padding sentinel / zero weights
-                           and zero of the per-expert count buffer.
-  2. ``_count_kernel``  -- **parallel** per-CTA ``gl.histogram`` of an N-chunk,
+  1. ``_count_kernel``  -- **parallel** per-CTA ``gl.histogram`` of an N-chunk,
                            atomic-added into a global ``counts`` buffer. This
                            replaces the old single-CTA histogram-over-N, which
                            was the align bottleneck (20->122us as M grows).
-  3. ``_offsets_kernel``-- single CTA but only O(E) work: prefix-sum counts ->
-                           per-expert start rows, write ``sorted_expert_ids`` +
-                           ``num_valid`` (EM) / ``num_blocks``.
-  4. ``_scatter_kernel``-- parallel: each routed slot atomically claims a rank
+  2. ``_offsets_kernel``-- initialize padded outputs in parallel, then use one
+                           CTA for the O(E) prefix-sum counts -> per-expert
+                           start rows, ``sorted_expert_ids`` + ``num_valid``
+                           (EM) / ``num_blocks``.
+  3. ``_scatter_kernel``-- parallel: each routed slot atomically claims a rank
                            within its expert (``buffer_atomic_add`` old value)
                            and writes its packed id + weight to that row.
 
@@ -52,24 +51,13 @@ are small ints, exact in fp32).
 from __future__ import annotations
 
 import torch
+
 from tokenspeed_kernel_amd._triton import gl, gluon, triton
 
 
 @gluon.jit
 def _add(a, b):
     return a + b
-
-
-@gluon.jit
-def _init_kernel(
-    sti_ptr, sw_ptr, EM_max, sentinel, BLOCK: gl.constexpr, NW: gl.constexpr
-):
-    L: gl.constexpr = gl.BlockedLayout([1], [64], [NW], [0])
-    pid = gl.program_id(0)
-    offs = pid * BLOCK + gl.arange(0, BLOCK, layout=L)
-    mask = offs < EM_max
-    gl.store(sti_ptr + offs, gl.full([BLOCK], sentinel, gl.int32, layout=L), mask=mask)
-    gl.store(sw_ptr + offs, gl.full([BLOCK], 0.0, gl.float32, layout=L), mask=mask)
 
 
 @gluon.jit
@@ -107,6 +95,10 @@ def _count_kernel(
 @gluon.jit
 def _offsets_kernel(
     counts_ptr,  # [BLOCK_E] float32 (from _count_kernel)
+    sti_ptr,  # [EM_max] out: padding sentinel, overwritten by scatter
+    sw_ptr,  # [EM_max] out: zero weights, overwritten by scatter
+    EM_max,
+    sentinel,
     num_experts,
     block_m,
     nb_max,
@@ -117,10 +109,31 @@ def _offsets_kernel(
     num_blocks_ptr,  # [1] out: num_blocks
     BLOCK_E: gl.constexpr,
     BLOCK_NB: gl.constexpr,
+    BLOCK_INIT: gl.constexpr,
     NW: gl.constexpr,
 ):
     LE: gl.constexpr = gl.BlockedLayout([1], [64], [NW], [0])
     LT: gl.constexpr = gl.BlockedLayout([1, 1], [1, 64], [NW, 1], [1, 0])
+    LI: gl.constexpr = gl.BlockedLayout([1], [64], [NW], [0])
+
+    # Every CTA initializes one output chunk. CTA 0 additionally computes the
+    # small O(E) prefix. Keeping both jobs in one grid removes a launch without
+    # serializing the padded-output fill onto the prefix CTA.
+    pid = gl.program_id(0)
+    init_offs = pid * BLOCK_INIT + gl.arange(0, BLOCK_INIT, layout=LI)
+    init_mask = init_offs < EM_max
+    gl.store(
+        sti_ptr + init_offs,
+        gl.full([BLOCK_INIT], sentinel, gl.int32, layout=LI),
+        mask=init_mask,
+    )
+    gl.store(
+        sw_ptr + init_offs,
+        gl.full([BLOCK_INIT], 0.0, gl.float32, layout=LI),
+        mask=init_mask,
+    )
+    if pid != 0:
+        return
 
     # ---- read parallel-computed counts (single CTA, only O(E) work) ----
     e_ids = gl.arange(0, BLOCK_E, layout=LE)
@@ -141,7 +154,7 @@ def _offsets_kernel(
         fill_ctr_ptr + e_ids,
         gl.full([BLOCK_E], 0.0, gl.float32, layout=LE),
         mask=valid_e,
-    )  # noqa: E501
+    )
     gl.store(num_valid_ptr, EM)
     gl.store(num_blocks_ptr, num_blocks)
 
@@ -253,10 +266,6 @@ def moe_align_block_size_device(
     )  # count_kernel accum
     meta = torch.empty(2, dtype=torch.int32, device=device)  # [EM, num_blocks]
 
-    INIT_BLOCK = 1024
-    _init_kernel[(triton.cdiv(EM_max, INIT_BLOCK),)](
-        sti, sw, EM_max, sentinel, BLOCK=INIT_BLOCK, NW=4, num_warps=4
-    )
     BLOCK_N = 1024
     _count_kernel[(triton.cdiv(N, BLOCK_N),)](
         exp_flat,
@@ -269,8 +278,13 @@ def moe_align_block_size_device(
         NW=4,
         num_warps=4,
     )
-    _offsets_kernel[(1,)](
+    INIT_BLOCK = 1024
+    _offsets_kernel[(triton.cdiv(EM_max, INIT_BLOCK),)](
         counts,
+        sti,
+        sw,
+        EM_max,
+        sentinel,
         num_experts,
         block_m,
         nb_max,
@@ -281,6 +295,7 @@ def moe_align_block_size_device(
         meta[1:2],
         BLOCK_E=BLOCK_E,
         BLOCK_NB=64,
+        BLOCK_INIT=INIT_BLOCK,
         NW=4,
         num_warps=4,
     )

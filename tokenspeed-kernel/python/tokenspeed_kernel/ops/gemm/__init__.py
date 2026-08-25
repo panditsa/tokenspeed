@@ -1061,6 +1061,10 @@ def mm(
         block_scale_layout = "flashinfer_mn"
 
     traits: dict[str, object] = {
+        "shape": (M, N, K),
+        "m": M,
+        "n": N,
+        "k": K,
         "n_align_16": N % 16 == 0,
         "k_align_16": K % 16 == 0,
         "k_align_32": K % 32 == 0,
@@ -1230,6 +1234,7 @@ def bmm(
         )
 
     traits: dict[str, object] = {
+        "shape": (batch, M, N, K),
         "batch": batch,
         "m": M,
         "n": N,

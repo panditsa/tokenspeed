@@ -71,6 +71,37 @@ register_cuda_ci(est_time=240, suite="runtime-1gpu")
 _LOWER_BOUND = -5.0
 
 
+@pytest.mark.parametrize("is_cdna4", [False, True])
+def test_kda_gate_dispatch_is_cdna4_only(monkeypatch, is_cdna4: bool) -> None:
+    backend = object.__new__(KdaAttnBackend)
+    f_a_out = torch.randn(3, 4)
+    f_b_weight = torch.randn(5, 4)
+    registered = torch.randn(3, 5)
+    fallback = torch.randn(3, 5)
+    called = []
+
+    def fake_mm(a, b):
+        called.append(("registered", a, b))
+        return registered
+
+    def fake_linear(a, b):
+        called.append(("fallback", a, b))
+        return fallback
+
+    monkeypatch.setattr(
+        hybrid_kda, "current_platform", lambda: SimpleNamespace(is_cdna4=is_cdna4)
+    )
+    monkeypatch.setattr("tokenspeed_kernel.ops.gemm.mm", fake_mm)
+    monkeypatch.setattr(torch.nn.functional, "linear", fake_linear)
+
+    actual = backend._kda_gate(None, f_a_out, f_b_weight)
+
+    assert actual is (registered if is_cdna4 else fallback)
+    assert called == [
+        ("registered" if is_cdna4 else "fallback", f_a_out, f_b_weight)
+    ]
+
+
 def test_prefill_hands_the_stored_state_to_the_op_untouched(monkeypatch) -> None:
     backend = object.__new__(KdaAttnBackend)
     backend.kda_recurrent_layout = "v_major"

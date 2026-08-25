@@ -27,19 +27,22 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
+from tokenspeed.runtime.layers.attention.backends.hybrid_linear_attn import (
+    HybridLinearAttnBackend,
+    MambaAttnBackend,
+    logger,
+)
 from tokenspeed_kernel.ops.activation.triton import rmsnorm_gated_sigmoid
 from tokenspeed_kernel.ops.attention import (
     kda_paged_decode,
     kda_paged_prefill,
-)
-from tokenspeed_kernel.ops.attention import (
-    kda_recurrent_layout as kda_recurrent_layout_default,
-)
-from tokenspeed_kernel.ops.attention import (
     kda_replay_commit_supported,
     resolve_kda_batched_replay_commit,
     try_kda_fused_paged_decode,
     try_kda_fused_paged_verify,
+)
+from tokenspeed_kernel.ops.attention import (
+    kda_recurrent_layout as kda_recurrent_layout_default,
 )
 from tokenspeed_kernel.ops.attention.triton.capture_payload import (
     capture_replay_payload,
@@ -47,13 +50,8 @@ from tokenspeed_kernel.ops.attention.triton.capture_payload import (
 from tokenspeed_kernel.ops.attention.triton.verify_state_blocks import (
     commit_state_pages,
 )
+from tokenspeed_kernel.platform import current_platform
 from typing_extensions import override
-
-from tokenspeed.runtime.layers.attention.backends.hybrid_linear_attn import (
-    HybridLinearAttnBackend,
-    MambaAttnBackend,
-    logger,
-)
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.configs.base import BaseAttnConfig
@@ -362,6 +360,10 @@ class KdaAttnBackend(MambaAttnBackend):
             The gate, or None when the model supplied neither form.
         """
         if g_raw is None and f_a_out is not None:
+            if current_platform().is_cdna4:
+                from tokenspeed_kernel.ops.gemm import mm
+
+                return mm(f_a_out, f_b_weight)
             return torch.nn.functional.linear(f_a_out, f_b_weight)
         else:
             return g_raw

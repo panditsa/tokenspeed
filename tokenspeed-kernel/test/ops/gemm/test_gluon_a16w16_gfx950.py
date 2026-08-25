@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import pytest
+import tokenspeed_kernel
 import torch
 from utils import is_cdna4
 
@@ -131,6 +132,78 @@ def test_dense16_bmm_rejects_unsupported_shape() -> None:
     b = torch.empty((12, 512, 128), device="cuda", dtype=torch.bfloat16)
 
     assert gluon_bmm_a16w16_gfx950(a, b, torch.bfloat16) is None
+
+
+@pytest.mark.parametrize(
+    "batch,m,n,k",
+    [(12, 32, 128, 512), (8, 28, 128, 512), (8, 28, 512, 128)],
+)
+def test_dense16_bmm_decode_writes_strided_out(
+    batch: int, m: int, n: int, k: int
+) -> None:
+    torch.manual_seed(1)
+    dtype = torch.bfloat16
+    attention = torch.randn((m, batch, k), device="cuda", dtype=dtype) * 0.25
+    a = attention.transpose(0, 1)
+    weight = torch.randn((batch, k, n), device="cuda", dtype=dtype) * 0.25
+    b = weight.transpose(1, 2)
+    backing = torch.empty((m, batch, n + 17), device="cuda", dtype=dtype)
+    out = backing[..., :n].transpose(0, 1)
+
+    actual = gluon_bmm_a16w16_gfx950(a, b, dtype, out=out)
+
+    assert actual is out
+    torch.testing.assert_close(out, torch.bmm(a, weight), atol=2e-2, rtol=2e-2)
+
+
+def test_registered_dense16_bmm_m28_query_captures() -> None:
+    torch.manual_seed(2)
+    batch, m, n, k = 8, 28, 512, 128
+    a = torch.randn((batch, m, k), device="cuda", dtype=torch.bfloat16) * 0.25
+    weight = torch.randn((batch, k, n), device="cuda", dtype=torch.bfloat16) * 0.25
+    b = weight.transpose(1, 2)
+    out = torch.empty((batch, m, n), device="cuda", dtype=torch.bfloat16)
+    expected = torch.bmm(a, weight)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = tokenspeed_kernel.bmm(a, b, out=out)
+    assert actual is out
+    graph.replay()
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(out, expected, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize(
+    "m,n,k",
+    [
+        (28, 3584, 7168),
+        (28, 2112, 7168),
+        (28, 7168, 1024),
+        (28, 7168, 1792),
+        (32, 1536, 128),
+        (32, 7168, 1536),
+        (32, 7168, 4224),
+    ],
+)
+def test_registered_dense16_decode_mm_matches_torch_and_captures(
+    m: int, n: int, k: int
+) -> None:
+    torch.manual_seed(m + k)
+    a = torch.randn((m, k), device="cuda", dtype=torch.bfloat16) * 0.25
+    b = torch.randn((n, k), device="cuda", dtype=torch.bfloat16) * 0.25
+    expected = torch.mm(a, b.T)
+    out = torch.empty_like(expected)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = tokenspeed_kernel.mm(a, b, out=out)
+    assert actual is out
+    graph.replay()
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(out, expected, atol=2e-1, rtol=2e-2)
 
 
 def test_splitk_smallm_out_handles_padded_reducer_rows() -> None:

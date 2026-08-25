@@ -105,7 +105,7 @@ def test_kimi3_latent_projection_writes_out_and_captures(
     torch.testing.assert_close(output, expected, rtol=2e-2, atol=2e-2)
 
 
-@pytest.mark.parametrize("num_tokens", [1, 2, 16])
+@pytest.mark.parametrize("num_tokens", [1, 2, 16, 32])
 def test_kimi3_latent_projection_add3_matches_torch_and_captures(
     num_tokens: int,
 ) -> None:
@@ -131,6 +131,15 @@ def test_kimi3_latent_projection_add3_matches_torch_and_captures(
     torch.cuda.synchronize()
 
     torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+    if num_tokens == 32:
+        composed = tokenspeed_kernel.kimi3_latent_projection_add3(
+            hidden_states,
+            weight,
+            prefix,
+            shared_output,
+            solution="composed",
+        )
+        assert torch.equal(actual, composed)
 
 
 def test_kimi3_rmsnorm_linear_add_matches_composed_and_captures() -> None:
@@ -284,11 +293,14 @@ def test_kimi3_shared_situ_projection_matches_reference_and_captures(
     torch.testing.assert_close(output, expected, rtol=2e-2, atol=2e-2)
 
 
-def test_kimi3_shared_down_projection_matches_torch_and_captures() -> None:
+@pytest.mark.parametrize("num_tokens", [1, 32])
+def test_kimi3_shared_down_projection_matches_torch_and_captures(
+    num_tokens: int,
+) -> None:
     torch.manual_seed(23)
-    hidden_states = torch.randn(1, 768, device="cuda", dtype=torch.bfloat16)
+    hidden_states = torch.randn(num_tokens, 768, device="cuda", dtype=torch.bfloat16)
     weight = torch.randn(7168, 768, device="cuda", dtype=torch.bfloat16)
-    output = torch.empty(1, 7168, device="cuda", dtype=torch.bfloat16)
+    output = torch.empty(num_tokens, 7168, device="cuda", dtype=torch.bfloat16)
     expected = torch.nn.functional.linear(hidden_states, weight)
 
     graph = torch.cuda.CUDAGraph()

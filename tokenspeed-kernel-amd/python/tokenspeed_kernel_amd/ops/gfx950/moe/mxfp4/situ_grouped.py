@@ -43,7 +43,7 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.fp16.moe_align_fused import (
 MXFP4_GROUP_SIZE = 32
 _MXFP4_GROUP_SIZE_GL = gl.constexpr(32)
 GROUPED_BLOCK_M = 64
-GROUPED_FUSED_ALIGN_MAX_ROUTES = 128
+GROUPED_FUSED_ALIGN_MAX_ROUTES = 512
 # Atomic combine's cost hardly depends on the batch size at all.  The list of
 # (token, expert) pairs is padded out to a full GROUPED_BLOCK_M-row block per
 # expert, so with 112 experts it is ~7168 rows even for a single token.

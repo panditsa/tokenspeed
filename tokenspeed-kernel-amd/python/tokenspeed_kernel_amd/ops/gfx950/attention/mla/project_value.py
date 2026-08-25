@@ -23,7 +23,11 @@
 from __future__ import annotations
 
 import torch
+
 from tokenspeed_kernel_amd._triton import gl, gluon
+from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (
+    gluon_bmm_a16w16_gfx950,
+)
 
 _LANES = gl.constexpr(64)
 _BLOCK_N = 8
@@ -90,8 +94,9 @@ def gluon_mla_project_value_gfx950(
     """Fuse per-head latent-to-value projection with optional sigmoid gating."""
 
     heads, latent, value = weight.shape
-    expected_attention = (1, heads, latent)
-    expected_output = (1, heads * value)
+    batch = attention.shape[0]
+    expected_attention = (batch, heads, latent)
+    expected_output = (batch, heads * value)
     tensors = (
         (attention, expected_attention, "attention"),
         (weight, (heads, latent, value), "weight"),
@@ -120,6 +125,26 @@ def gluon_mla_project_value_gfx950(
         or not out.is_contiguous()
     ):
         raise ValueError("MLA value projection out must be contiguous BF16")
+
+    if batch in (28, 32):
+        output_view = out.view(batch, heads, value).transpose(0, 1)
+        gate_view = (
+            None
+            if gate is None
+            else gate.view(batch, heads, value).transpose(0, 1)
+        )
+        result = gluon_bmm_a16w16_gfx950(
+            attention.transpose(0, 1),
+            weight.transpose(1, 2),
+            torch.bfloat16,
+            out=output_view,
+            gate=gate_view,
+        )
+        if result is None:
+            raise ValueError("unsupported batched MLA value projection layout")
+        return out
+    if batch != 1:
+        raise ValueError("MLA value projection requires batch 1, 28, or 32")
 
     gate_tensor = attention if gate is None else gate
     _mla_project_value_kernel[(heads * value // _BLOCK_N,)](

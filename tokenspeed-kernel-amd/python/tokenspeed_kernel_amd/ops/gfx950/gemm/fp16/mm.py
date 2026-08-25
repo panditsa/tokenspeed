@@ -255,6 +255,21 @@ def _mfma_lds_gload_layout_b(block_n: int, block_k: int, _num_warps: int):
 
 
 @gluon.constexpr_function
+def _mfma_lds_gload_layout_b_ncontig(
+    block_n: int, block_k: int, _num_warps: int
+):
+    """Global-load layout for a logical [N, K] B view with unit N stride."""
+    if block_n == 32 and _num_warps == 4:
+        return gl.BlockedLayout(
+            [block_k // 64, 8],
+            [16, 4],
+            [4, 1],
+            [1, 0],
+        )
+    return _mfma_lds_gload_layout_b(block_n, block_k, _num_warps)
+
+
+@gluon.constexpr_function
 def _mfma_lds_manual_shared_offsets_a(block_m: int, block_k: int):
     bases = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32]]
     if block_k >= 128:
@@ -459,6 +474,124 @@ def _bmm_a16w16_m1_kernel(
     gl.store(
         output_ptr + batch * output_batch_stride + offs_n,
         result.to(output_ptr.dtype.element_ty),
+    )
+
+
+@gluon.jit
+def _bmm_a16w16_m32_mfma_kernel(
+    a_ptr,
+    b_ptr,
+    gate_ptr,
+    output_ptr,
+    M,
+    N,
+    K: gl.constexpr,
+    stride_ab,
+    stride_am,
+    stride_ak,
+    stride_bb,
+    stride_bn,
+    stride_bk,
+    stride_cb,
+    stride_cm,
+    stride_cn,
+    stride_gb,
+    stride_gm,
+    stride_gn,
+    BLOCK_M: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    BLOCK_K: gl.constexpr,
+    HAS_GATE: gl.constexpr,
+):
+    """Batched MFMA tile for weights stored with a unit logical-N stride."""
+    pid_n = gl.program_id(0)
+    batch = gl.program_id(1)
+    num_warps: gl.constexpr = 4
+    gload_a: gl.constexpr = _mfma_lds_gload_layout_a(
+        BLOCK_M, BLOCK_K, num_warps
+    )
+    gload_b: gl.constexpr = _mfma_lds_gload_layout_b_ncontig(
+        BLOCK_N, BLOCK_K, num_warps
+    )
+    mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
+        version=4,
+        instr_shape=[16, 16, 32],
+        transposed=True,
+        warps_per_cta=[2, 2],
+    )
+    dot_a: gl.constexpr = gl.DotOperandLayout(
+        operand_index=0, parent=mfma_layout, k_width=8
+    )
+    dot_b: gl.constexpr = gl.DotOperandLayout(
+        operand_index=1, parent=mfma_layout, k_width=8
+    )
+    shared_a: gl.constexpr = _mfma_lds_shared_layout_a(
+        dot_a, BLOCK_M, BLOCK_K, a_ptr.dtype.element_ty
+    )
+    shared_b: gl.constexpr = _mfma_lds_shared_layout_b(
+        dot_b, BLOCK_N, BLOCK_K, b_ptr.dtype.element_ty
+    )
+    smem_a = gl.allocate_shared_memory(
+        a_ptr.dtype.element_ty, [BLOCK_M, BLOCK_K], shared_a
+    )
+    smem_b = gl.allocate_shared_memory(
+        b_ptr.dtype.element_ty, [BLOCK_K, BLOCK_N], shared_b
+    )
+
+    offs_am = gl.arange(0, BLOCK_M, gl.SliceLayout(1, gload_a))
+    offs_ak = gl.arange(0, BLOCK_K, gl.SliceLayout(0, gload_a))
+    offs_bk = gl.arange(0, BLOCK_K, gl.SliceLayout(1, gload_b))
+    offs_bn = gl.arange(0, BLOCK_N, gl.SliceLayout(0, gload_b))
+    n_base = pid_n * BLOCK_N
+    a_base = batch * stride_ab
+    b_base = batch * stride_bb + n_base * stride_bn
+    acc = gl.zeros((BLOCK_M, BLOCK_N), gl.float32, mfma_layout)
+
+    for k_tile in gl.static_range(K // BLOCK_K):
+        k_base = k_tile * BLOCK_K
+        a_offsets = (
+            a_base
+            + offs_am[:, None] * stride_am
+            + (k_base + offs_ak[None, :]) * stride_ak
+        ).to(gl.int32)
+        b_offsets = (
+            b_base
+            + (k_base + offs_bk[:, None]) * stride_bk
+            + offs_bn[None, :] * stride_bn
+        ).to(gl.int32)
+        a = cdna4.buffer_load(
+            a_ptr,
+            a_offsets,
+            mask=offs_am[:, None] < M,
+            other=0.0,
+        )
+        b = cdna4.buffer_load(b_ptr, b_offsets)
+        smem_a.store(a)
+        smem_b.store(b)
+        gl.barrier()
+        acc = cdna4.mfma(smem_a.load(dot_a), smem_b.load(dot_b), acc)
+        gl.barrier()
+
+    offs_cm = gl.arange(0, BLOCK_M, gl.SliceLayout(1, mfma_layout))
+    offs_cn = gl.arange(0, BLOCK_N, gl.SliceLayout(0, mfma_layout))
+    c_offsets = (
+        batch * stride_cb
+        + offs_cm[:, None] * stride_cm
+        + (n_base + offs_cn[None, :]) * stride_cn
+    ).to(gl.int32)
+    projected = acc.to(output_ptr.dtype.element_ty).to(gl.float32)
+    if HAS_GATE:
+        gate_offsets = (
+            batch * stride_gb
+            + offs_cm[:, None] * stride_gm
+            + (n_base + offs_cn[None, :]) * stride_gn
+        ).to(gl.int32)
+        gate = cdna4.buffer_load(gate_ptr, gate_offsets).to(gl.float32)
+        projected *= 1.0 / (1.0 + gl.exp(-gate))
+    gl.store(
+        output_ptr + c_offsets,
+        projected.to(output_ptr.dtype.element_ty),
+        mask=(offs_cm[:, None] < M) & (n_base + offs_cn[None, :] < N),
     )
 
 
@@ -1049,6 +1182,11 @@ def _mfma_lds_mediumm_kernel(
     c_offsets = offs_cm[:, None] * stride_cm + offs_cn[None, :] * stride_cn
     c_mask = (cm[:, None] < M) & (cn[None, :] < N)
     if ADD3:
+        # Match the composed path: the GEMM is materialized in the output
+        # dtype before add3 reloads it into FP32.  Keeping that rounding point
+        # makes fusion numerically equivalent while still removing a launch
+        # and the intermediate tensor write/read.
+        projected = acc_store.to(c_ptr.dtype.element_ty).to(gl.float32)
         addend_a_offsets = (
             offs_cm[:, None] * stride_addend_am + offs_cn[None, :] * stride_addend_an
         )
@@ -1065,18 +1203,19 @@ def _mfma_lds_mediumm_kernel(
             + pid_m * BLOCK_M * stride_addend_bm
             + pid_n * BLOCK_N * stride_addend_bn
         )
-        acc_store += cdna4.buffer_load(
+        acc_store = cdna4.buffer_load(
             ptr=addend_a_base,
             offsets=addend_a_offsets,
             mask=c_mask,
             other=0.0,
-        )
+        ).to(gl.float32)
+        acc_store += projected
         acc_store += cdna4.buffer_load(
             ptr=addend_b_base,
             offsets=addend_b_offsets,
             mask=c_mask,
             other=0.0,
-        )
+        ).to(gl.float32)
     c_base = c_ptr + pid_m * BLOCK_M * stride_cm + pid_n * BLOCK_N * stride_cn
     cdna4.buffer_store(
         ptr=c_base,
@@ -1130,16 +1269,18 @@ def _get_partial_scratch(
     return partial
 
 
-def _check_supported_dense16_shape(M: int, N: int, K: int) -> None:
+def _check_supported_dense16_shape(
+    M: int, N: int, K: int, *, n_alignment: int = DENSE16_BLOCK_N
+) -> None:
     if M <= 0 or N <= 0 or K <= 0:
         raise ValueError(
             f"dense16 Gluon GEMM requires positive M/N/K, got M={M}, N={N}, K={K}"
         )
     if M > MAX_M:
         raise ValueError(f"dense16 Gluon GEMM requires M <= {MAX_M}; got M={M}")
-    if N % DENSE16_BLOCK_N != 0:
+    if N % n_alignment != 0:
         raise ValueError(
-            f"dense16 Gluon GEMM requires N to be a multiple of {DENSE16_BLOCK_N}; "
+            f"dense16 Gluon GEMM requires N to be a multiple of {n_alignment}; "
             f"got N={N}"
         )
     if K % DENSE16_BLOCK_K != 0:
@@ -1200,7 +1341,11 @@ def _use_mfma_lds_smallm(_M: int, _N: int, _K: int) -> bool:
 def _choose_mfma_lds_mediumm_config(
     M: int, N: int, K: int
 ) -> tuple[int, int, int, int, int, int] | None:
-    if M < 8 or K % DENSE16_BLOCK_K != 0 or N % DENSE16_BLOCK_N != 0:
+    if K % DENSE16_BLOCK_K != 0 or N % 32 != 0:
+        return None
+    if M < 8:
+        return None
+    if N % DENSE16_BLOCK_N != 0 and (M, N, K) != (28, 2112, 7168):
         return None
     if (K, N) == (7168, 3584) and 768 <= M <= 1024 and M % 128 == 0:
         return 128, 128, DENSE16_BLOCK_K, 2, 4, 3
@@ -1208,6 +1353,18 @@ def _choose_mfma_lds_mediumm_config(
         return 128, 128, DENSE16_BLOCK_K, 2, 4, 3
     if M <= 32:
         block_m = 16 if M <= 16 else 32
+        if (M, N, K) == (28, 7168, 1024):
+            return 32, 32, 512, 2, 2, 2
+        if (M, N, K) == (28, 7168, 1792):
+            return 32, 32, 256, 2, 2, 3
+        if (M, N, K) == (28, 3584, 7168):
+            return 32, 32, 256, 2, 2, 3
+        if (M, N, K) == (28, 2112, 7168):
+            return 32, 32, 256, 2, 2, 3
+        if (M, N, K) == (32, 7168, 1536):
+            return 32, 32, DENSE16_BLOCK_K, 2, 2, 3
+        if (M, N, K) == (32, 7168, 4224):
+            return 32, 32, 128, 2, 2, 3
         if K == DENSE16_BLOCK_K:
             return block_m, 32, DENSE16_BLOCK_K, 2, 2, 1
         if K < 1024:
@@ -1330,6 +1487,7 @@ def gluon_bmm_a16w16_gfx950(
     *,
     alpha: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
+    gate: torch.Tensor | None = None,
 ) -> torch.Tensor | None:
     """Compute the Kimi decode-head ``A @ B.T`` BMM shape."""
     if A.ndim != 3 or B.ndim != 3:
@@ -1343,16 +1501,16 @@ def gluon_bmm_a16w16_gfx950(
 
     batch, M, K = A.shape
     batch_b, N, K_b = B.shape
-    if (
-        batch not in (12, 16)
-        or batch_b != batch
-        or M != 1
-        or N != 512
-        or K != 128
-        or K_b != K
-    ):
+    shape = (batch, M, N, K)
+    if batch_b != batch or K_b != K or shape not in {
+        (8, 28, 128, 512),
+        (8, 28, 512, 128),
+        (12, 1, 512, 128),
+        (16, 1, 512, 128),
+        (12, 32, 128, 512),
+    }:
         return None
-    if A.stride(-1) != 1 or B.stride(1) != 1:
+    if A.stride(-1) != 1 or min(B.stride(1), B.stride(2)) != 1:
         return None
 
     C = _resolve_output(
@@ -1362,22 +1520,62 @@ def gluon_bmm_a16w16_gfx950(
         out,
         "small-M dense16 warp-reduce BMM",
     )
-    _bmm_a16w16_m1_kernel[(batch * N // BMM_M1_BLOCK_N,)](
+    if M == 1:
+        _bmm_a16w16_m1_kernel[(batch * N // BMM_M1_BLOCK_N,)](
+            A,
+            B,
+            C,
+            A.stride(0),
+            B.stride(0),
+            B.stride(2),
+            C.stride(0),
+            K=K,
+            N=N,
+            BLOCK_N=BMM_M1_BLOCK_N,
+            NUM_WARPS=BMM_M1_NUM_WARPS,
+            WAVEFRONT_SIZE=CDNA_WAVEFRONT_SIZE,
+            num_warps=BMM_M1_NUM_WARPS,
+            num_stages=1,
+            waves_per_eu=0,
+        )
+        return C
+
+    if gate is not None and (
+        gate.shape != C.shape
+        or gate.dtype != C.dtype
+        or gate.device != C.device
+        or gate.stride(-1) != 1
+    ):
+        raise ValueError("gated dense16 BMM requires gate to match its output")
+
+    block_k = 128 if K == 128 else 256
+    grid = (triton.cdiv(N, 32), batch)
+    _bmm_a16w16_m32_mfma_kernel[grid](
         A,
         B,
+        C if gate is None else gate,
         C,
+        M,
+        N,
+        K,
         A.stride(0),
+        A.stride(1),
+        A.stride(2),
         B.stride(0),
+        B.stride(1),
         B.stride(2),
         C.stride(0),
-        K=K,
-        N=N,
-        BLOCK_N=BMM_M1_BLOCK_N,
-        NUM_WARPS=BMM_M1_NUM_WARPS,
-        WAVEFRONT_SIZE=CDNA_WAVEFRONT_SIZE,
-        num_warps=BMM_M1_NUM_WARPS,
-        num_stages=1,
-        waves_per_eu=0,
+        C.stride(1),
+        C.stride(2),
+        C.stride(0) if gate is None else gate.stride(0),
+        C.stride(1) if gate is None else gate.stride(1),
+        C.stride(2) if gate is None else gate.stride(2),
+        BLOCK_M=32,
+        BLOCK_N=32,
+        BLOCK_K=block_k,
+        HAS_GATE=gate is not None,
+        num_warps=4,
+        llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"),),
     )
     return C
 
@@ -1539,7 +1737,7 @@ def gluon_mm_a16w16_mfma_lds_mediumm_gfx950(
             "medium-M dense16 MFMA LDS GEMM K mismatch: "
             f"A={tuple(A.shape)} B={tuple(B.shape)}"
         )
-    _check_supported_dense16_shape(M, N, K)
+    _check_supported_dense16_shape(M, N, K, n_alignment=32)
     config = _choose_mfma_lds_mediumm_config(M, N, K)
     if config is None:
         raise ValueError(
@@ -1587,16 +1785,18 @@ def gluon_mm_a16w16_mfma_lds_mediumm_gfx950(
     return C
 
 
-def gluon_mm_a16w16_add3_m16_gfx950(
+def gluon_mm_a16w16_add3_smallm_gfx950(
     A: torch.Tensor,
     B: torch.Tensor,
     addend_a: torch.Tensor,
     addend_b: torch.Tensor,
 ) -> torch.Tensor:
-    """Compute ``A @ B.T + addend_a + addend_b`` for the tuned M=16 tile."""
-    if A.shape != (16, 3584) or B.shape != (7168, 3584):
+    """Compute ``A @ B.T + addend_a + addend_b`` for tuned K3 tiles."""
+    M = A.shape[0]
+    if M not in (16, 32) or A.shape[1:] != (3584,) or B.shape != (7168, 3584):
         raise ValueError(
-            "M=16 dense16 add3 expects A [16, 3584] and B [7168, 3584], "
+            "small-M dense16 add3 expects A [M, 3584] with M in {16, 32} "
+            "and B [7168, 3584], "
             f"got A={tuple(A.shape)} B={tuple(B.shape)}"
         )
     for name, tensor in (
@@ -1605,20 +1805,22 @@ def gluon_mm_a16w16_add3_m16_gfx950(
         ("addend_b", addend_b),
     ):
         if tensor.device != A.device or tensor.dtype != A.dtype:
-            raise ValueError(f"M=16 dense16 add3 {name} must match A dtype and device")
-    if A.dtype not in _SUPPORTED_DTYPES or not A.is_cuda:
-        raise ValueError("M=16 dense16 add3 requires CUDA/HIP fp16 or bf16 tensors")
-    if not A.is_contiguous() or not B.is_contiguous():
-        raise ValueError("M=16 dense16 add3 requires contiguous GEMM inputs")
-    for name, tensor in (("addend_a", addend_a), ("addend_b", addend_b)):
-        if tensor.shape != (16, 7168) or tensor.stride(1) != 1:
             raise ValueError(
-                f"M=16 dense16 add3 {name} must have shape [16, 7168] "
+                f"small-M dense16 add3 {name} must match A dtype and device"
+            )
+    if A.dtype not in _SUPPORTED_DTYPES or not A.is_cuda:
+        raise ValueError("small-M dense16 add3 requires CUDA/HIP fp16 or bf16 tensors")
+    if not A.is_contiguous() or not B.is_contiguous():
+        raise ValueError("small-M dense16 add3 requires contiguous GEMM inputs")
+    for name, tensor in (("addend_a", addend_a), ("addend_b", addend_b)):
+        if tensor.shape != (M, 7168) or tensor.stride(1) != 1:
+            raise ValueError(
+                f"small-M dense16 add3 {name} must have shape [{M}, 7168] "
                 "and unit inner stride"
             )
 
-    C = A.new_empty((16, 7168))
-    block_m, block_n, block_k = 16, 32, 128
+    C = A.new_empty((M, 7168))
+    block_m, block_n, block_k = (16, 32, 128) if M == 16 else (32, 32, 256)
     warps_m, warps_n, num_buffers = 2, 2, 3
     grid = (triton.cdiv(7168, block_n),)
     _mfma_lds_mediumm_kernel[grid](
@@ -1627,7 +1829,7 @@ def gluon_mm_a16w16_add3_m16_gfx950(
         C,
         addend_a,
         addend_b,
-        16,
+        M,
         7168,
         3584,
         A.stride(0),
@@ -1695,7 +1897,9 @@ def gluon_mm_a16w16_gfx950(
         return None
     if M <= 0 or N <= 0 or K <= 0:
         return None
-    if N % DENSE16_BLOCK_N != 0 or K % DENSE16_BLOCK_K != 0:
+    if K % DENSE16_BLOCK_K != 0:
+        return None
+    if N % DENSE16_BLOCK_N != 0 and (M, N, K) != (28, 2112, 7168):
         return None
 
     if _use_mfma_lds_largem(M, N, K):

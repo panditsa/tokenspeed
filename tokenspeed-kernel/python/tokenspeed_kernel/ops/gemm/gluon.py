@@ -35,6 +35,7 @@ from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 if current_platform().is_amd:
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (
         gluon_bmm_a16w16_gfx950 as _bmm_a16w16_impl,
+        gluon_mm_a16w16_gfx950 as _mm_a16w16_impl,
     )
 
     try:
@@ -46,6 +47,62 @@ if current_platform().is_amd:
         _linear_attnres_partials_impl = None
     else:
         _IMPORT_ERROR = None
+
+    @register_kernel(
+        "gemm",
+        "mm",
+        name="gluon_mm_a16w16_gfx950",
+        solution="gluon",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(9, 5),
+            max_arch_version=ArchVersion(9, 5),
+            vendors=frozenset({"amd"}),
+        ),
+        signatures=frozenset(
+            {
+                format_signature(
+                    a=dense_tensor_format(torch.bfloat16),
+                    b=dense_tensor_format(torch.bfloat16),
+                ),
+            }
+        ),
+        priority=Priority.SPECIALIZED,
+        traits={
+            "shape": frozenset(
+                {
+                    (28, 3584, 7168),
+                    (28, 2112, 7168),
+                    (28, 7168, 1024),
+                    (28, 7168, 1792),
+                    (32, 1536, 128),
+                    (32, 7168, 1536),
+                    (32, 7168, 4224),
+                }
+            ),
+        },
+    )
+    def gluon_mm_a16w16_gfx950(
+        A: torch.Tensor,
+        B: torch.Tensor,
+        A_scales: torch.Tensor | None,
+        B_scales: torch.Tensor | None,
+        out_dtype: torch.dtype,
+        *,
+        alpha: torch.Tensor | None = None,
+        block_size: list[int] | None = None,
+        out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if A_scales is not None or B_scales is not None:
+            raise ValueError("dense16 Gluon MM does not accept quantization scales")
+        if block_size is not None:
+            raise ValueError("dense16 Gluon MM does not accept block_size")
+
+        output = _mm_a16w16_impl(A, B, out_dtype, alpha=alpha, out=out)
+        if output is None:
+            raise ValueError(
+                "dense16 Gluon MM was selected for an unsupported input shape"
+            )
+        return output
 
     @register_kernel(
         "gemm",
@@ -67,10 +124,14 @@ if current_platform().is_amd:
         ),
         priority=Priority.SPECIALIZED,
         traits={
-            "batch": frozenset({12, 16}),
-            "m": frozenset({1}),
-            "n": frozenset({512}),
-            "k": frozenset({128}),
+            "shape": frozenset(
+                {
+                    (8, 28, 512, 128),
+                    (12, 1, 512, 128),
+                    (16, 1, 512, 128),
+                    (12, 32, 128, 512),
+                }
+            ),
             "a_inner_stride_one": frozenset({True}),
             "b_n_stride_one": frozenset({True}),
             "out_inner_stride_one": frozenset({True}),

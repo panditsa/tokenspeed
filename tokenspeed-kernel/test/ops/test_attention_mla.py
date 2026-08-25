@@ -989,6 +989,55 @@ def test_mla_project_value_fallback_preserves_fp32_gate_math(
     assert not torch.equal(output, attention.reshape(1, 1) * gate.sigmoid())
 
 
+@pytest.mark.parametrize("batch,heads", [(28, 8), (32, 12)])
+@pytest.mark.parametrize("use_gate", [False, True])
+def test_mla_project_value_gfx950_decode_matches_torch_and_captures(
+    device: str,
+    batch: int,
+    heads: int,
+    use_gate: bool,
+) -> None:
+    if not platform.is_cdna4:
+        pytest.skip("small-batch MLA value projection is specific to CDNA4")
+    from tokenspeed_kernel import mla_project_value
+    from tokenspeed_kernel.ops.attention import (
+        mla_project_value_prefers_contiguous_weight,
+    )
+
+    assert mla_project_value_prefers_contiguous_weight(
+        dtype=torch.bfloat16,
+        heads=heads,
+        latent_dim=512,
+        value_dim=128,
+        gated=use_gate,
+        batch_size=batch,
+    )
+
+    torch.manual_seed(71)
+    attention = torch.randn(batch, heads, 512, device=device, dtype=torch.bfloat16)
+    weight = torch.randn(heads, 512, 128, device=device, dtype=torch.bfloat16)
+    gate = torch.randn(batch, heads * 128, device=device, dtype=torch.bfloat16)
+    output = torch.empty_like(gate)
+    projected = torch.bmm(attention.transpose(0, 1).contiguous(), weight)
+    expected = projected.transpose(0, 1).reshape_as(output)
+    if use_gate:
+        expected = (expected.float() * gate.float().sigmoid()).to(torch.bfloat16)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        returned = mla_project_value(
+            attention,
+            weight,
+            gate=gate if use_gate else None,
+            out=output,
+        )
+    assert returned is output
+    graph.replay()
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(output, expected, atol=2e-2, rtol=2e-2)
+
+
 def test_mla_project_value_nvidia_fallback_writes_projection_directly(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

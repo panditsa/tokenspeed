@@ -526,7 +526,7 @@ def kimi3_latent_projection_add3(
             solution = "skinny_add3"
         elif m == 1 and specialized:
             solution = "rowcta_gemv"
-        elif Platform.get().is_cdna4 and m == 16 and specialized:
+        elif Platform.get().is_cdna4 and m in (16, 32) and specialized:
             solution = "gluon_mfma_add3"
         else:
             solution = "composed"
@@ -561,16 +561,16 @@ def kimi3_latent_projection_add3(
             shared_output,
         )
     if solution == "gluon_mfma_add3":
-        if not Platform.get().is_cdna4 or m != 16 or not specialized:
+        if not Platform.get().is_cdna4 or m not in (16, 32) or not specialized:
             raise ValueError(
-                "gluon_mfma_add3 projection-add3 requires 16 contiguous CUDA "
-                "BF16 rows with the K3 3584->7168 shape on CDNA4"
+                "gluon_mfma_add3 projection-add3 requires 16 or 32 contiguous "
+                "CUDA BF16 rows with the K3 3584->7168 shape on CDNA4"
             )
         from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (
-            gluon_mm_a16w16_add3_m16_gfx950,
+            gluon_mm_a16w16_add3_smallm_gfx950,
         )
 
-        return gluon_mm_a16w16_add3_m16_gfx950(
+        return gluon_mm_a16w16_add3_smallm_gfx950(
             hidden_states,
             weight,
             prefix,
@@ -723,7 +723,7 @@ def kimi3_shared_down_projection(
     expected_output = (m, output_width)
     if out is None:
         out = hidden_states.new_empty(expected_output)
-    if solution not in {"auto", "triton_gemv", "torch"}:
+    if solution not in {"auto", "triton_gemv", "gluon_mfma", "torch"}:
         raise ValueError(f"unknown Kimi K3 shared down solution {solution!r}")
     specialized = (
         hidden_states.is_cuda
@@ -731,19 +731,23 @@ def kimi3_shared_down_projection(
         and weight.dtype == torch.bfloat16
         and hidden_states.is_contiguous()
         and weight.is_contiguous()
-        and m == 1
         and input_width == KIMI3_SHARED_LOCAL_SIZE
         and output_width == KIMI3_HIDDEN_SIZE
     )
     routed = solution == "auto"
     if solution == "auto":
-        solution = "triton_gemv" if Platform.get().is_cdna4 and specialized else "torch"
+        if Platform.get().is_cdna4 and specialized and m == 1:
+            solution = "triton_gemv"
+        elif Platform.get().is_cdna4 and specialized and m == 32:
+            solution = "gluon_mfma"
+        else:
+            solution = "torch"
     if routed and decode_gemv_routed(hidden_states, weight):
         from tokenspeed_kernel.ops.gemm.triton_gemv import decode_gemv
 
         return decode_gemv(hidden_states, weight, out)
     if solution == "triton_gemv":
-        if not specialized:
+        if not specialized or m != 1:
             raise ValueError(
                 "Kimi K3 shared down Triton GEMV requires contiguous gfx950 "
                 "BF16 [1, 768] input and [7168, 768] weight"
@@ -754,6 +758,22 @@ def kimi3_shared_down_projection(
             out=out,
             config=(8, 512, 8, 1),
             validate=False,
+        )
+    if solution == "gluon_mfma":
+        if not Platform.get().is_cdna4 or not specialized or m != 32:
+            raise ValueError(
+                "Kimi K3 shared down Gluon MFMA requires contiguous gfx950 "
+                "BF16 [32, 768] input and [7168, 768] weight"
+            )
+        from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (
+            gluon_mm_a16w16_mfma_lds_mediumm_gfx950,
+        )
+
+        return gluon_mm_a16w16_mfma_lds_mediumm_gfx950(
+            hidden_states,
+            weight,
+            hidden_states.dtype,
+            out=out,
         )
     return torch.mm(hidden_states, weight.T, out=out)
 
