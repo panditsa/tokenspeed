@@ -18,8 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Small-M (M<=4) FP8 x MXFP4 warp-decode MoE: fused dense top-k +
-gate_up GEMM + SwiGLU + FP8 requant stage 1, and the split-K stage 2."""
+"""FP8 x MXFP4 route-direct MoE with fused top-k and two warp-decode stages."""
 
 from __future__ import annotations
 
@@ -52,6 +51,39 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused.routing import (
 )
 
 
+def _warp_decode_stage1_config(n_tokens: int) -> tuple[int, int]:
+    if n_tokens == 1:
+        return 16, 1
+    if n_tokens == 2:
+        return 32, 4
+    return 64, 1
+
+
+def _warp_decode_stage2_config(
+    n_tokens: int, *, canonical_gpt_oss: bool
+) -> tuple[int, int, int]:
+    if canonical_gpt_oss:
+        tuned = {
+            1: (16, 4, 8),
+            4: (32, 4, 8),
+            8: (64, 4, 4),
+            16: (64, 4, 2),
+            20: (64, 8, 2),
+            24: (64, 4, 4),
+            25: (64, 8, 2),
+            26: (128, 8, 4),
+            27: (64, 8, 4),
+            28: (64, 4, 2),
+            32: (64, 8, 2),
+        }.get(n_tokens)
+        if tuned is not None:
+            return tuned
+
+    block_n = 32 if n_tokens >= 16 else (8 if n_tokens <= 1 else 16)
+    split_k = 8 if n_tokens <= 2 else (4 if n_tokens <= 4 else 1)
+    return block_n, 4, split_k
+
+
 def _gluon_mxfp4_fp8_warp_decode_moe(
     hidden_states: torch.Tensor,
     router_logits: torch.Tensor,
@@ -77,10 +109,11 @@ def _gluon_mxfp4_fp8_warp_decode_moe(
         return None
     n_tokens = int(router_logits.shape[0])
     n_experts = int(router_logits.shape[1])
-    if n_tokens > WARP_DECODE_MAX_M:
+    if n_tokens < 1 or router_logits.dtype not in _ROUTE_GL_DTYPE:
         return None
-    if not gluon_route_supported(router_logits, top_k, router_logits.dtype):
-        return None
+    standard_route_supported = gluon_route_supported(
+        router_logits, top_k, router_logits.dtype
+    )
 
     # Use the optional Gluon dot-layout preshuffled attachments when they match
     # the layout this warp-decode path knows how to consume.
@@ -130,6 +163,10 @@ def _gluon_mxfp4_fp8_warp_decode_moe(
     N = int(getattr(w2_raw, "original_n", w2_n_phys))
     if w2_preshuffled and (N > w2_n_phys or w2_n_phys % 128 != 0):
         return None
+    canonical_gpt_oss = n_experts == 128 and top_k == 4 and D == i_dim == N == 2880
+    max_m = GPT_OSS_WARP_DECODE_MAX_M if canonical_gpt_oss else WARP_DECODE_MAX_M
+    if n_tokens > max_m or (not canonical_gpt_oss and not standard_route_supported):
+        return None
 
     # Stage1 computes the dense top-k inside the kernel; allocate its outputs.
     router_logits_c = router_logits.contiguous()
@@ -158,63 +195,72 @@ def _gluon_mxfp4_fp8_warp_decode_moe(
     b2 = w2_bias if w2_bias is not None else dummy_bias
 
     BLOCK_K = 128
-    S2_BLOCK_N = 32 if n_tokens >= 16 else (8 if n_tokens <= 1 else 16)
-    S2_M_DUP = 4
-    # Tuned stage2 K=I split factor by batch size (8/4 raise small-M occupancy, off for M>=5).
-    if n_tokens <= 2:
-        s2_split_k = 8
-    elif n_tokens <= 4:
-        s2_split_k = 4
-    else:
-        s2_split_k = 1
+    S2_BLOCK_N, S2_M_DUP, s2_split_k = _warp_decode_stage2_config(
+        n_tokens, canonical_gpt_oss=canonical_gpt_oss
+    )
 
     inter = torch.empty(
         (n_tokens * top_k, i_dim), dtype=x_fp8.dtype, device=hidden_states.device
     )
-    # Cooperative-LDS, num_warps=4, software-pipelined stage1 -- the smallest-M
-    # decode path (this wrapper is only entered for n_tokens <= WARP_DECODE_MAX_M).
-    # BLOCK_N=64 maximizes CTAs/CU for non-preshuffled W. Preshuffled W13 is
-    # laid out as 128-wide CTA tiles, so the first decode preshuffle path
-    # consumes full 128-wide tiles and lets SwiGLU reduce them to 64 columns.
-    COOP_NUM_WARPS = 4
-    COOP_BLOCK_N = 128 if w13_preshuffled else 64
-    COOP_BLOCK_K = 256
-    coop_k_iters = (D + COOP_BLOCK_K - 1) // COOP_BLOCK_K
-    coop_even_k = D % COOP_BLOCK_K == 0
-    # decode_pipeline() prefetches NUM_BUFFERS-1 tiles before the main loop.
-    # For short synthetic shapes (for example D=256) the fixed 3-buffer GPT-OSS
-    # schedule over-prefetches past the only real K tile. Keep the production
-    # 3-buffer schedule when possible, but shrink the pipeline for short K.
-    COOP_NUM_BUFFERS = min(3, coop_k_iters + (1 if coop_even_k else 0))
-    coop_grid = (n_tokens * ((2 * i_dim + COOP_BLOCK_N - 1) // COOP_BLOCK_N) * top_k,)
-    # X is stored as raw i8 in LDS and bitcast to e4m3 in mfma_scaled; pass the
-    # uint8 view (an fp8 LDS buffer fails to lower).
     x_uint8 = x_fp8.view(torch.uint8)
-    # fmt: off
-    _warp_decode_topk_stage1_coop_kernel[coop_grid](
-        x_uint8, router_logits_c, w13_raw, w13_scale, topk_ids, topk_weights, inter,
-        n_tokens, n_experts, D, i_dim,
-        x_uint8.stride(0), x_uint8.stride(1),
-        router_logits_c.stride(0), topk_ids.stride(0), topk_weights.stride(0),
-        w13_raw.stride(0), w13_raw.stride(-2), w13_raw.stride(-1),
-        w13_scale.stride(0), w13_scale.stride(-2), w13_scale.stride(-1),
-        inter.stride(0), inter.stride(1),
-        w13_act_scale, w2_act_scale, b13,
-        D_PACKED=D // 2, TOPK=top_k,
-        # EP/TKP: padded widths of the [tokens, experts] logits tile and the
-        # top-k selection tile; >= 64*num_warps keeps the blocked layout valid.
-        EP=max(_route_next_pow2(n_experts), 64 * COOP_NUM_WARPS), TKP=64 * COOP_NUM_WARPS,
-        X_DTYPE=_ROUTE_GL_DTYPE[router_logits.dtype],
-        BLOCK_K=COOP_BLOCK_K, BLOCK_N=COOP_BLOCK_N, BLOCK_M=16,
-        NUM_BUFFERS=COOP_NUM_BUFFERS, NUM_WARPS=COOP_NUM_WARPS,
-        W_PRESHUFFLED=w13_preshuffled,
-        EVEN_K=coop_even_k,
-        HAS_BIAS=w13_bias is not None,
-        SWIGLU_ALPHA=float(swiglu_alpha), SWIGLU_LIMIT=float(swiglu_limit),
-        SWIGLU_BETA=float(swiglu_beta),
-        num_warps=COOP_NUM_WARPS,
-    )
-    # fmt: on
+    if canonical_gpt_oss:
+        S1_BLOCK_N, S1_M_DUP = _warp_decode_stage1_config(n_tokens)
+        s1_grid = (n_tokens * ((2 * i_dim + S1_BLOCK_N - 1) // S1_BLOCK_N) * top_k,)
+        # fmt: off
+        _warp_decode_topk_stage1_direct_kernel[s1_grid](
+            x_uint8, router_logits_c, w13_raw, w13_scale,
+            topk_ids, topk_weights, inter,
+            n_tokens, n_experts, D, i_dim,
+            x_uint8.stride(0), x_uint8.stride(1),
+            router_logits_c.stride(0), topk_ids.stride(0), topk_weights.stride(0),
+            w13_raw.stride(0), w13_raw.stride(-2), w13_raw.stride(-1),
+            w13_scale.stride(0), w13_scale.stride(-2), w13_scale.stride(-1),
+            inter.stride(0), inter.stride(1),
+            w13_act_scale, w2_act_scale, b13,
+            D_PACKED=D // 2, TOPK=top_k,
+            EP=max(_route_next_pow2(n_experts), 64), TKP=64,
+            BLOCK_K=BLOCK_K, BLOCK_N=S1_BLOCK_N, M_DUP=S1_M_DUP,
+            W_PRESHUFFLED=w13_preshuffled,
+            HAS_BIAS=w13_bias is not None,
+            SWIGLU_ALPHA=float(swiglu_alpha), SWIGLU_LIMIT=float(swiglu_limit),
+            SWIGLU_BETA=float(swiglu_beta),
+            num_warps=1,
+        )
+        # fmt: on
+    else:
+        # Keep the cooperative implementation as the fallback for other shapes.
+        COOP_NUM_WARPS = 4
+        COOP_BLOCK_N = 128 if w13_preshuffled else 64
+        COOP_BLOCK_K = 256
+        coop_k_iters = (D + COOP_BLOCK_K - 1) // COOP_BLOCK_K
+        coop_even_k = D % COOP_BLOCK_K == 0
+        COOP_NUM_BUFFERS = min(3, coop_k_iters + (1 if coop_even_k else 0))
+        coop_grid = (
+            n_tokens * ((2 * i_dim + COOP_BLOCK_N - 1) // COOP_BLOCK_N) * top_k,
+        )
+        # fmt: off
+        _warp_decode_topk_stage1_coop_kernel[coop_grid](
+            x_uint8, router_logits_c, w13_raw, w13_scale,
+            topk_ids, topk_weights, inter,
+            n_tokens, n_experts, D, i_dim,
+            x_uint8.stride(0), x_uint8.stride(1),
+            router_logits_c.stride(0), topk_ids.stride(0), topk_weights.stride(0),
+            w13_raw.stride(0), w13_raw.stride(-2), w13_raw.stride(-1),
+            w13_scale.stride(0), w13_scale.stride(-2), w13_scale.stride(-1),
+            inter.stride(0), inter.stride(1),
+            w13_act_scale, w2_act_scale, b13,
+            D_PACKED=D // 2, TOPK=top_k,
+            EP=max(_route_next_pow2(n_experts), 64 * COOP_NUM_WARPS),
+            TKP=64 * COOP_NUM_WARPS,
+            X_DTYPE=_ROUTE_GL_DTYPE[router_logits.dtype],
+            BLOCK_K=COOP_BLOCK_K, BLOCK_N=COOP_BLOCK_N, BLOCK_M=16,
+            NUM_BUFFERS=COOP_NUM_BUFFERS, NUM_WARPS=COOP_NUM_WARPS,
+            W_PRESHUFFLED=w13_preshuffled, EVEN_K=coop_even_k,
+            HAS_BIAS=w13_bias is not None,
+            SWIGLU_ALPHA=float(swiglu_alpha), SWIGLU_LIMIT=float(swiglu_limit),
+            SWIGLU_BETA=float(swiglu_beta), num_warps=COOP_NUM_WARPS,
+        )
+        # fmt: on
 
     n_tiles2 = (N + S2_BLOCK_N - 1) // S2_BLOCK_N
     if s2_split_k > 1:
@@ -262,9 +308,11 @@ def _gluon_mxfp4_fp8_warp_decode_moe(
     return out
 
 
-# Warp-decode is only for the smallest decode regime. M>=8 should use the
-# medium-decode direct path selected by the ragged matmul path below.
 WARP_DECODE_MAX_M = 4
+# Tuned ceiling for the canonical GPT-OSS route-direct path. Unlike
+# the fused ragged router, this path computes dense top-k independently inside
+# each route-direct stage-1 CTA and does not construct gather/scatter metadata.
+GPT_OSS_WARP_DECODE_MAX_M = 32
 
 
 @gluon.jit
@@ -759,7 +807,7 @@ def _warp_decode_precomputed_situ_stage1_kernel(
 
 
 @gluon.jit
-def _warp_decode_stage2_preshuffled_w_offset(
+def _warp_decode_preshuffled_w_offset(
     w_expert_off,
     k_pack,
     n_col,
@@ -787,7 +835,7 @@ def _warp_decode_stage2_preshuffled_w_offset(
 
 
 @gluon.jit
-def _warp_decode_stage2_load_tile(
+def _warp_decode_load_tile(
     kt,
     ak,
     bk,
@@ -820,9 +868,7 @@ def _warp_decode_stage2_load_tile(
         gl.int32
     )
     if W_PRESHUFFLED:
-        b_off = _warp_decode_stage2_preshuffled_w_offset(
-            w_expert_off, k_pack, n_cols, N_PHYS
-        )
+        b_off = _warp_decode_preshuffled_w_offset(w_expert_off, k_pack, n_cols, N_PHYS)
     else:
         b_off = (w_n_off + k_pack.to(gl.int64) * stride_wk).to(gl.int32)
     if BLOCK_K_SCALE == 4:
@@ -850,7 +896,7 @@ def _warp_decode_stage2_load_tile(
 
 
 @gluon.jit
-def _warp_decode_stage2_load_pair(
+def _warp_decode_load_pair(
     kt,
     ak,
     bk,
@@ -878,13 +924,13 @@ def _warp_decode_stage2_load_pair(
 ):
     """Load the even (kt) and odd (kt+1) K-tiles of one pipeline step."""
     # fmt: off
-    a_even, b_even, s_even = _warp_decode_stage2_load_tile(
+    a_even, b_even, s_even = _warp_decode_load_tile(
         kt, ak, bk, bsk, am, X, W, WScale,
         x_row_off, w_expert_off, w_n_off, ws_expert_off, scale_row_off,
         n_cols, stride_xk, stride_wk, stride_wsk, N_PHYS, i_dim,
         BLOCK_K, BLOCK_K_PACKED, BLOCK_K_SCALE, I_PACKED, W_PRESHUFFLED,
     )
-    a_odd, b_odd, s_odd = _warp_decode_stage2_load_tile(
+    a_odd, b_odd, s_odd = _warp_decode_load_tile(
         kt + 1, ak, bk, bsk, am, X, W, WScale,
         x_row_off, w_expert_off, w_n_off, ws_expert_off, scale_row_off,
         n_cols, stride_xk, stride_wk, stride_wsk, N_PHYS, i_dim,
@@ -895,9 +941,7 @@ def _warp_decode_stage2_load_pair(
 
 
 @gluon.jit
-def _warp_decode_stage2_mfma_pair(
-    acc, a_even, b_even, s_even, a_odd, b_odd, s_odd, a_scale
-):
+def _warp_decode_mfma_pair(acc, a_even, b_even, s_even, a_odd, b_odd, s_odd, a_scale):
     """Accumulate the scaled-MFMA of one even+odd K-tile pair (fp8 x mxfp4)."""
     # fmt: off
     acc = gl.amd.cdna4.mfma_scaled(
@@ -910,6 +954,298 @@ def _warp_decode_stage2_mfma_pair(
     )
     # fmt: on
     return acc
+
+
+@gluon.jit
+def _warp_decode_topk_stage1_direct_kernel(
+    X,
+    Logits,
+    W,
+    WScale,
+    TopkIdsOut,
+    TopkWeightsOut,
+    Y,
+    M,
+    E,
+    D,
+    i_dim,
+    stride_xm,
+    stride_xk,
+    stride_lm,
+    stride_tim,
+    stride_twm,
+    stride_we,
+    stride_wk,
+    stride_wn,
+    stride_wse,
+    stride_wsk,
+    stride_wsn,
+    stride_ym,
+    stride_yn,
+    x_global_scale_ptr,
+    out_quant_scale_ptr,
+    w13_bias,
+    D_PACKED: gl.constexpr,
+    TOPK: gl.constexpr,
+    EP: gl.constexpr,
+    TKP: gl.constexpr,
+    BLOCK_K: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    M_DUP: gl.constexpr,
+    W_PRESHUFFLED: gl.constexpr,
+    HAS_BIAS: gl.constexpr,
+    SWIGLU_ALPHA: gl.constexpr,
+    SWIGLU_LIMIT: gl.constexpr,
+    SWIGLU_BETA: gl.constexpr,
+):
+    """Single-wave route-direct W13 using global-to-register MFMA operands."""
+    pid = gl.program_id(axis=0)
+    num_pid_n = gl.cdiv(2 * i_dim, BLOCK_N)
+    slot = pid % TOPK
+    rest = pid // TOPK
+    pid_n = rest % num_pid_n
+    token = rest // num_pid_n
+
+    # Select the expert directly from this token's dense routing scores. This
+    # produces no ragged metadata and performs no gather/scatter alignment.
+    LE: gl.constexpr = gl.BlockedLayout([1], [64], [1], [0])
+    LT: gl.constexpr = gl.BlockedLayout([1], [64], [1], [0])
+    e = gl.arange(0, EP, layout=LE)
+    emask = e < E
+    cur = gl.load(
+        Logits + token.to(gl.int64) * stride_lm + e,
+        mask=(token < M) & emask,
+        other=float("-inf"),
+    ).to(gl.float32)
+    t = gl.arange(0, TKP, layout=LT)
+    val_t = gl.full([TKP], -1e30, gl.float32, layout=LT)
+    idx_t = gl.zeros([TKP], gl.int32, layout=LT)
+    live = (token < M) & emask
+    topmask = gl.full([EP], 0x80000000, gl.uint32, layout=LE)
+    fullmask = gl.full([EP], 0xFFFFFFFF, gl.uint32, layout=LE)
+    zero_pack = gl.full([EP], 0, gl.uint64, layout=LE)
+    for r in gl.static_range(TOPK):
+        raw = cur.to(gl.uint32, bitcast=True)
+        value_key = raw ^ gl.where((raw & topmask) != 0, fullmask, topmask)
+        index_key = (EP - e).to(gl.uint32)
+        packed = (value_key.to(gl.uint64) << 16) | index_key.to(gl.uint64)
+        best = gl.max(gl.where(live, packed, zero_pack), axis=0)
+        amax = (EP - (best & 0xFFFF).to(gl.int32)).to(gl.int32)
+        chosen = live & (e == amax)
+        vmax = gl.sum(gl.where(chosen, cur, gl.zeros_like(cur)), axis=0)
+        sel = t == r
+        val_t = gl.where(sel, vmax, val_t)
+        idx_t = gl.where(sel, amax, idx_t)
+        live = live & (e != amax)
+    rmax = gl.max(val_t, axis=0)
+    num = gl.exp(val_t - rmax)
+    gate_t = gl.fdiv(num, gl.sum(num, axis=0))
+    if (pid_n == 0) & (slot == 0):
+        gl.store(
+            TopkIdsOut + token.to(gl.int64) * stride_tim + t,
+            idx_t,
+            mask=(token < M) & (t < TOPK),
+        )
+        gl.store(
+            TopkWeightsOut + token.to(gl.int64) * stride_twm + t,
+            gate_t.to(TopkWeightsOut.dtype.element_ty),
+            mask=(token < M) & (t < TOPK),
+        )
+    expert = gl.sum(
+        gl.where(t == slot, idx_t, gl.zeros([TKP], gl.int32, layout=LT)), axis=0
+    )
+
+    BLOCK_K_PACKED: gl.constexpr = BLOCK_K // 2
+    BLOCK_K_SCALE: gl.constexpr = BLOCK_K // 32
+    if W_PRESHUFFLED:
+        gl.static_assert(
+            128 % BLOCK_N == 0 and BLOCK_K_PACKED == 64,
+            "warp-decode direct W13 expects BLOCK_N to divide the 128-wide "
+            "shuffled tile and BLOCK_K_PACKED=64",
+        )
+    layouts: gl.constexpr = _warp_decode_mfma_layouts(M_DUP, BLOCK_N, BLOCK_K_SCALE)
+    mfma_layout: gl.constexpr = layouts[0]
+    dot_a_layout: gl.constexpr = layouts[1]
+    dot_b_layout: gl.constexpr = layouts[2]
+    a_scale_layout: gl.constexpr = layouts[3]
+    b_scale_layout: gl.constexpr = layouts[4]
+    am = gl.arange(0, M_DUP, layout=gl.SliceLayout(1, dot_a_layout))[:, None]
+    ak = gl.arange(0, BLOCK_K, layout=gl.SliceLayout(0, dot_a_layout))[None, :]
+    bk = gl.arange(0, BLOCK_K_PACKED, layout=gl.SliceLayout(1, dot_b_layout))[:, None]
+    bn = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, dot_b_layout))[None, :]
+    bsn = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(1, b_scale_layout))[:, None]
+    bsk = gl.arange(0, BLOCK_K_SCALE, layout=gl.SliceLayout(0, b_scale_layout))[None, :]
+    n_cols = pid_n * BLOCK_N + bn
+    n_cols_s = pid_n * BLOCK_N + bsn
+    a_scale = gl.full((M_DUP, BLOCK_K_SCALE), 127, gl.uint8, layout=a_scale_layout)
+    acc = gl.zeros((M_DUP, BLOCK_N), dtype=gl.float32, layout=mfma_layout)
+
+    if (token < M) & (expert >= 0):
+        x_row_off = token.to(gl.int64) * stride_xm
+        w_expert_off = expert.to(gl.int64) * stride_we
+        ws_expert_off = expert.to(gl.int64) * stride_wse
+        w_n_off = w_expert_off + n_cols.to(gl.int64) * stride_wn
+        scale_row = n_cols_s.to(gl.uint32)
+        scale_row_off = (scale_row // 32).to(gl.int64) * stride_wsn + (
+            (scale_row % 16) * 4 + ((scale_row % 32) // 16)
+        ).to(gl.int64) * stride_wsk
+        num_full = D // BLOCK_K
+        total_kt = (D + BLOCK_K - 1) // BLOCK_K
+        main_end = (num_full // 2) * 2
+
+        # Global loads feed registers directly; there is no LDS descriptor,
+        # async copy, barrier, or cooperative multi-wave program here.
+        if main_end > 0:
+            (
+                a_even,
+                b_even,
+                s_even,
+                a_odd,
+                b_odd,
+                s_odd,
+            ) = _warp_decode_load_pair(
+                0,
+                ak,
+                bk,
+                bsk,
+                am,
+                X,
+                W,
+                WScale,
+                x_row_off,
+                w_expert_off,
+                w_n_off,
+                ws_expert_off,
+                scale_row_off,
+                n_cols,
+                stride_xk,
+                stride_wk,
+                stride_wsk,
+                2 * i_dim,
+                D,
+                BLOCK_K,
+                BLOCK_K_PACKED,
+                BLOCK_K_SCALE,
+                D_PACKED,
+                W_PRESHUFFLED,
+            )
+            for kt in range(0, main_end - 2, 2):
+                (
+                    next_a_even,
+                    next_b_even,
+                    next_s_even,
+                    next_a_odd,
+                    next_b_odd,
+                    next_s_odd,
+                ) = _warp_decode_load_pair(
+                    kt + 2,
+                    ak,
+                    bk,
+                    bsk,
+                    am,
+                    X,
+                    W,
+                    WScale,
+                    x_row_off,
+                    w_expert_off,
+                    w_n_off,
+                    ws_expert_off,
+                    scale_row_off,
+                    n_cols,
+                    stride_xk,
+                    stride_wk,
+                    stride_wsk,
+                    2 * i_dim,
+                    D,
+                    BLOCK_K,
+                    BLOCK_K_PACKED,
+                    BLOCK_K_SCALE,
+                    D_PACKED,
+                    W_PRESHUFFLED,
+                )
+                acc = _warp_decode_mfma_pair(
+                    acc, a_even, b_even, s_even, a_odd, b_odd, s_odd, a_scale
+                )
+                a_even, b_even, s_even = next_a_even, next_b_even, next_s_even
+                a_odd, b_odd, s_odd = next_a_odd, next_b_odd, next_s_odd
+            acc = _warp_decode_mfma_pair(
+                acc, a_even, b_even, s_even, a_odd, b_odd, s_odd, a_scale
+            )
+        for kt in range(main_end, total_kt):
+            a_tile, b_tile, s_tile = _warp_decode_load_tile(
+                kt,
+                ak,
+                bk,
+                bsk,
+                am,
+                X,
+                W,
+                WScale,
+                x_row_off,
+                w_expert_off,
+                w_n_off,
+                ws_expert_off,
+                scale_row_off,
+                n_cols,
+                stride_xk,
+                stride_wk,
+                stride_wsk,
+                2 * i_dim,
+                D,
+                BLOCK_K,
+                BLOCK_K_PACKED,
+                BLOCK_K_SCALE,
+                D_PACKED,
+                W_PRESHUFFLED,
+                MASK_TAIL=True,
+            )
+            acc = gl.amd.cdna4.mfma_scaled(
+                a=a_tile,
+                a_scale=a_scale,
+                a_format="e4m3",
+                b=b_tile,
+                b_scale=s_tile,
+                b_format="e2m1",
+                acc=acc,
+            )
+
+        acc = acc * gl.load(x_global_scale_ptr).to(gl.float32)
+        if HAS_BIAS:
+            bias_n = pid_n * BLOCK_N + gl.arange(
+                0, BLOCK_N, layout=gl.SliceLayout(0, mfma_layout)
+            )
+            acc = _add_expert_bias(
+                acc,
+                w13_bias + expert.to(gl.int64) * (2 * i_dim),
+                bias_n,
+                bias_n < 2 * i_dim,
+                mfma_layout,
+            )
+
+    out = _swiglu_reduce(
+        acc,
+        SWIGLU_ALPHA,
+        SWIGLU_LIMIT,
+        SWIGLU_BETA,
+        BLOCK_N // 2,
+        mfma_layout,
+    )
+    out = (out * (1.0 / gl.load(out_quant_scale_ptr).to(gl.float32))).to(
+        Y.dtype.element_ty
+    )
+    store_layout: gl.constexpr = out.type.layout
+    sm = gl.arange(0, M_DUP, layout=gl.SliceLayout(1, store_layout))[:, None]
+    sn = gl.arange(0, BLOCK_N // 2, layout=gl.SliceLayout(0, store_layout))[None, :]
+    col = pid_n * (BLOCK_N // 2) + sn
+    row = token * TOPK + slot
+    gl.store(
+        Y
+        + row.to(gl.int64) * stride_ym
+        + col.to(gl.int64) * stride_yn
+        + sm.to(gl.int64) * 0,
+        out,
+        mask=(token < M) & (sm == 0) & (col < i_dim),
+    )
 
 
 @gluon.jit
@@ -1044,7 +1380,7 @@ def _warp_decode_stage2_fp8_mxfp4_kernel(
                 # fmt: off
                 if main_kt > 0:
                     (a_even, b_even, s_even,
-                     a_odd, b_odd, s_odd) = _warp_decode_stage2_load_pair(
+                     a_odd, b_odd, s_odd) = _warp_decode_load_pair(
                         kt_start, ak, bk, bsk, am, X, W, WScale,
                         x_row_off, w_expert_off, w_n_off, ws_expert_off, scale_row_off,
                         n_cols, stride_xk, stride_wk, stride_wsk, N_PHYS, i_dim,
@@ -1052,13 +1388,13 @@ def _warp_decode_stage2_fp8_mxfp4_kernel(
                     )
                     for kt in range(kt_start, main_end - 2, 2):
                         (nxt_a_even, nxt_b_even, nxt_s_even,
-                         nxt_a_odd, nxt_b_odd, nxt_s_odd) = _warp_decode_stage2_load_pair(
+                         nxt_a_odd, nxt_b_odd, nxt_s_odd) = _warp_decode_load_pair(
                             kt + 2, ak, bk, bsk, am, X, W, WScale,
                             x_row_off, w_expert_off, w_n_off, ws_expert_off, scale_row_off,
                             n_cols, stride_xk, stride_wk, stride_wsk, N_PHYS, i_dim,
                             BLOCK_K, BLOCK_K_PACKED, BLOCK_K_SCALE, I_PACKED, W_PRESHUFFLED,
                         )
-                        acc = _warp_decode_stage2_mfma_pair(
+                        acc = _warp_decode_mfma_pair(
                             acc, a_even, b_even, s_even, a_odd, b_odd, s_odd, a_scale
                         )
                         a_even, b_even, s_even, a_odd, b_odd, s_odd = (
@@ -1066,12 +1402,12 @@ def _warp_decode_stage2_fp8_mxfp4_kernel(
                             nxt_a_odd, nxt_b_odd, nxt_s_odd,
                         )
                     # Epilogue: MFMA the final prefetched pair.
-                    acc = _warp_decode_stage2_mfma_pair(
+                    acc = _warp_decode_mfma_pair(
                         acc, a_even, b_even, s_even, a_odd, b_odd, s_odd, a_scale
                     )
                 # Masked remainder: leftover odd/partial K-tile(s) in this split.
                 for kt in range(main_end, kt_stop):
-                    a_t, b_t, s_t = _warp_decode_stage2_load_tile(
+                    a_t, b_t, s_t = _warp_decode_load_tile(
                         kt, ak, bk, bsk, am, X, W, WScale,
                         x_row_off, w_expert_off, w_n_off, ws_expert_off, scale_row_off,
                         n_cols, stride_xk, stride_wk, stride_wsk, N_PHYS, i_dim,
